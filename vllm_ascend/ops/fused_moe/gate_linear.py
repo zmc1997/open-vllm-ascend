@@ -21,6 +21,9 @@ import torch
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+
 
 class AscendGateLinear(GateLinear):
     """Ascend replacement for vLLM GateLinear.
@@ -50,6 +53,12 @@ class AscendGateLinear(GateLinear):
             force_fp32_compute=True,
             prefix=prefix,
         )
+        # GLM-5.2 passes this gate to MoE; the FP32 weight enables its internal router.
+        if not bias and getattr(get_ascend_config(), "fused_mc2_shared_schedule", False):
+            # GateLinear uses the upstream method; install the Ascend loader
+            # hook before checkpoint post-processing creates weight_fp32.
+            self.quant_method = AscendUnquantizedLinearMethod()
+            self.precast_fp32_weight = True
 
     def forward(self, x: torch.Tensor):
         # TODO: Remove this workaround after upgrading to a vLLM version that

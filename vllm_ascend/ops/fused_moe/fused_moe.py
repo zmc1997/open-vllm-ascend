@@ -45,6 +45,7 @@ from vllm_ascend.ops.activation import AscendSituAndMul, SituActivationConfig
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.shared_schedule import run_scheme3
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
@@ -408,6 +409,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             )
 
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
+        self.fused_mc2_shared_schedule = getattr(ascend_config, "fused_mc2_shared_schedule", False)
         self.multistream_overlap_shared_expert = (
             ascend_config.multistream_overlap_shared_expert and shared_experts is not None
         )
@@ -590,6 +592,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
 
     @property
     def is_internal_router(self) -> bool:
+        if getattr(self, "fused_mc2_shared_schedule", False) and self._shared_experts is None:
+            return False
         gate = self.gate
         return gate is not None and hasattr(gate, "weight_fp32")
 
@@ -717,7 +721,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self.routed_experts._ascend_moe_lora_context = lora_context
 
     def no_shared_forward_impl(  # type: ignore[override]
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        return_with_event: bool = False,
+        before_fused_experts: Callable[[], None] | None = None,
     ) -> torch.Tensor | FusedMoEResult:
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
@@ -774,6 +782,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask,
+            **({"before_fused_experts": before_fused_experts} if before_fused_experts is not None else {}),
         )
 
         if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
@@ -950,6 +959,118 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
 
         return self._finalize_shared_expert_output(shared_out)
 
+    def _scheduled_shared_steps(self, hidden_states):
+        swiglu_limit = getattr(self.routed_experts, "swiglu_limit", None)
+        swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
+        swiglu_alpha = getattr(self.routed_experts, "swiglu_alpha", None) if self.quant_type == QuantType.W8A8 else None
+        swiglu_alpha = 1.0 if swiglu_alpha is None else swiglu_alpha
+        swiglu_beta = getattr(self.routed_experts, "swiglu_beta", None) if self.quant_type == QuantType.W8A8 else None
+        swiglu_beta = 0.0 if swiglu_beta is None else swiglu_beta
+        original_dtype = hidden_states.dtype
+        # Execute dynamic quant concurrently with MoE gate.
+        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+        # Gateup starts after gating, potentially overlapping TopK.
+        yield None
+        hidden_states = torch_npu.npu_quant_matmul(
+            quantized_x,
+            self._shared_experts.gate_up_proj.weight,
+            self._shared_experts.gate_up_proj.weight_scale,
+            pertoken_scale=None,
+            bias=None,
+            output_dtype=torch.int32,
+        )
+        # Activation starts after TopK, potentially overlapping the fused op.
+
+        yield None
+        quantized_x, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
+            x=hidden_states,
+            weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
+            activation_scale=pertoken_scale,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=None,
+            activate_left=True,
+            quant_mode=1,
+            swiglu_mode=1,
+            clamp_limit=swiglu_limit,
+            glu_alpha=swiglu_alpha,
+            glu_bias=swiglu_beta,
+        )
+        # Down starts after the routed op and its finalization.
+        yield None
+        shared_out = torch_npu.npu_quant_matmul(
+            quantized_x,
+            self._shared_experts.down_proj.weight,
+            self._shared_experts.down_proj.weight_scale,
+            pertoken_scale=swiglu_out_scale,
+            bias=None,
+            output_dtype=original_dtype,
+        )
+        yield shared_out
+
+    def _can_schedule_fused_shared(self):
+        if not getattr(self, "fused_mc2_shared_schedule", False):
+            return False
+        shared = self._shared_experts
+        reason = None
+        if _EXTRA_CTX.moe_comm_type != MoECommType.FUSED_MC2 or get_ascend_config().enable_fused_mc2 != 1:
+            reason = "current communication path is not dispatch_ffn_combine"
+        elif _EXTRA_CTX.use_mega_moe:
+            reason = "MegaMoE is active"
+        elif not self.is_internal_router:
+            reason = "router is external"
+        elif self.quant_type not in (QuantType.W8A8, QuantType.W4A8):
+            reason = "requires integer W8A8 or W4A8"
+        elif shared is None or isinstance(shared.act_fn, AscendSituAndMul):
+            reason = "requires a shared SwiGLU expert"
+        elif getattr(self.activation, "value", self.activation) != "silu":
+            reason = "requires routed silu activation"
+        elif getattr(self.routed_experts, "mix_placement", False):
+            reason = "mixed shared/routed expert placement is unsupported"
+        elif getattr(self.routed_experts, "_ascend_moe_lora_context", None) is not None:
+            reason = "LoRA is active"
+        elif not all(
+            hasattr(proj, "weight_scale") and getattr(proj, "bias", None) is None
+            for proj in (shared.gate_up_proj, shared.down_proj)
+        ):
+            reason = "requires bias-free quantized shared projections"
+        elif type(getattr(self._quant_method, "quant_method", None)).__name__ not in (
+            "AscendW8A8DynamicFusedMoEMethod",
+            "AscendW4A8DynamicFusedMoEMethod",
+        ):
+            reason = "quantization backend does not support the routing callback"
+        elif any(proj.weight.dtype != torch.int8 for proj in (shared.gate_up_proj, shared.down_proj)):
+            reason = "requires INT8 shared weights"
+        elif getattr(shared, "expert_gate", None) is not None:
+            reason = "gated shared experts are unsupported"
+        elif not hasattr(shared.gate_up_proj, "weight_scale_fp32"):
+            reason = "shared FP32 scale is unavailable"
+        if reason is not None:
+            logger.warning_once("fused_mc2_shared_schedule scheme 3 fallback: %s", reason)
+            return False
+        return True
+
+    def _scheduled_shared_forward(self, hidden_states, shared_hidden_states):
+        logger.info_once("fused_mc2_shared_schedule: scheme 3 entered (host scheduling path; once per process)")
+        prepared_shared_input = self._prepare_shared_expert_input(shared_hidden_states)
+
+        def gate():
+            return F.linear(shared_hidden_states.float(), self.gate.weight_fp32)
+
+        def route(logits, callback):
+            return self.no_shared_forward_impl(hidden_states, logits, before_fused_experts=callback)
+
+        shared_out, routed_out = run_scheme3(
+            torch.npu,
+            shared_experts_calculation_stream(),
+            prepared_shared_input,
+            self._scheduled_shared_steps(prepared_shared_input),
+            gate,
+            route,
+        )
+        return self._finalize_shared_expert_output(shared_out), routed_out
+
     def shared_forward_impl(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
@@ -957,6 +1078,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         shared_experts_input: torch.Tensor | None = None,
     ):
         shared_hidden_states = shared_experts_input if shared_experts_input is not None else hidden_states
+        if self._can_schedule_fused_shared():
+            return self._scheduled_shared_forward(hidden_states, shared_hidden_states)
         if self.is_internal_router:
             gate = self.gate
             assert gate is not None
