@@ -520,6 +520,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
         tid2eid: torch.Tensor | None = None,
+        before_fused_experts: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         num_shared_experts = getattr(layer, "n_shared_experts", 0)
         if num_shared_experts is None:
@@ -589,6 +590,9 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             w2_scale_bias = [layer.w2_scale_bias.detach()] if hasattr(layer, "w2_scale_bias") else None
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
+        if before_fused_experts is not None:
+            before_fused_experts()
+
         return moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
