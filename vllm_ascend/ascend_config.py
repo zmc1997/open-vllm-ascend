@@ -151,6 +151,9 @@ class AscendConfig:
                     str(vllm_config.scheduler_config.max_num_batched_tokens),
                 )
         self.multistream_overlap_shared_expert = additional_config.get("multistream_overlap_shared_expert", False)
+        self.fused_mc2_shared_schedule = additional_config.get("fused_mc2_shared_schedule", False)
+        if not isinstance(self.fused_mc2_shared_schedule, bool):
+            raise ValueError("fused_mc2_shared_schedule must be a boolean")
         # PD-disaggregated D node only (kv_consumer); invalid on P nodes and in PD-mixed mode.
         # DSV4 oproj / embedding fine-grained TP (oproj_tensor_parallel_size /
         # embedding_tensor_parallel_size) use static, graph-stable exchange
