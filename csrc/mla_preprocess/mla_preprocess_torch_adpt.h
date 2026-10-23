@@ -131,6 +131,8 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
     const int64_t quantMode = mla_preprocess_detail::ParseQuantMode(quant_mode);
     const bool enableInnerOut = enable_inner_out.value_or(false);
     const bool enableRope = cos.has_value();
+    const bool directOutput = false;
+    const int64_t noWriteback = 0;
     const at::Tensor slotMapping =
         slotmapping.scalar_type() == at::kLong ? slotmapping.to(at::kInt) : slotmapping;
 
@@ -185,10 +187,10 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
         enableRope,
         kvCacheStride0,
         kvCacheRopeStride0,
-        false,
-        int64_t{0},
-        int64_t{0},
-        int64_t{0},
+        directOutput,
+        noWriteback,
+        noWriteback,
+        noWriteback,
         q_out0,
         kv_cache_out0,
         q_out1,
@@ -237,15 +239,15 @@ mla_preprocess_without_kv_cache_write(
              &beta1.value(), &descale0.value(), &descale1.value(), &cos.value(), &sin.value(),
              &quant_scale0.value(), &quant_scale1.value(), &quant_offset0.value(), &quant_offset1.value(),
              &bias0.value(), &bias1.value(), &q_out0, &q_out1, &inner_out, &current_k, &current_rope}) {
-        const auto format = at_npu::native::get_npu_format(*tensor);
+        const auto format = at_npu::native::custom_ops::get_npu_format(*tensor);
         TORCH_CHECK(format == ACL_FORMAT_ND || format == ACL_FORMAT_NCHW,
                     "mla_preprocess_without_kv_cache_write requires ND-compatible input and output storage");
     }
-    TORCH_CHECK(at_npu::native::get_npu_format(wdqkv) == ACL_FORMAT_FRACTAL_NZ &&
-                at_npu::native::get_npu_format(wuq) == ACL_FORMAT_FRACTAL_NZ,
+    TORCH_CHECK(at_npu::native::custom_ops::get_npu_format(wdqkv) == ACL_FORMAT_FRACTAL_NZ &&
+                at_npu::native::custom_ops::get_npu_format(wuq) == ACL_FORMAT_FRACTAL_NZ,
                 "mla_preprocess_without_kv_cache_write requires transformed NZ projection weights");
     if (writeback_slots.has_value()) {
-        const auto format = at_npu::native::get_npu_format(writeback_slots.value());
+        const auto format = at_npu::native::custom_ops::get_npu_format(writeback_slots.value());
         TORCH_CHECK(format == ACL_FORMAT_ND || format == ACL_FORMAT_NCHW,
                     "MLAPO writeback_slots requires ND-compatible storage");
     }
@@ -254,13 +256,20 @@ mla_preprocess_without_kv_cache_write(
     const at::Tensor slots = writeback_slots.has_value()
         ? writeback_slots.value()
         : at::empty({hiddenState.size(0)}, hiddenState.options().dtype(at::kInt));
+    const int64_t cacheMode = 1;
+    const int64_t quantMode = 0;
+    const bool enableInnerOut = true;
+    const bool enableRope = true;
+    const bool directOutput = true;
+    const int64_t kvStride0 = current_k.stride(0);
+    const int64_t ropeStride0 = current_rope.stride(0);
     EXEC_NPU_CMD(
         aclnnMlaPreprocess,
         hiddenState, quant_scale0, quant_offset0, wdqkv, bias0, gamma1, beta1,
         quant_scale1, quant_offset1, gamma2, sin, cos, sin, cos,
         current_k, slots, wuq, bias1, wuk, descale0, descale1, ctkv_scale, q_nope_scale,
-        int64_t{1}, int64_t{0}, true, true, current_k.stride(0), current_rope.stride(0),
-        true, writeback_k_base, writeback_rope_base, writeback_capacity,
+        cacheMode, quantMode, enableInnerOut, enableRope, kvStride0, ropeStride0,
+        directOutput, writeback_k_base, writeback_rope_base, writeback_capacity,
         q_out0, current_k, q_out1, current_rope, inner_out);
     return std::forward_as_tuple(q_out0, q_out1, inner_out, current_k, current_rope);
 }
