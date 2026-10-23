@@ -332,6 +332,37 @@ def test_main_spec_controls_reuse_regardless_of_indexer():
     assert layout.layer_cache_specs[1].indexer is not None
 
 
+def test_mixed_indexer_formats_use_separate_shared_slots():
+    main_spec = _make_sfa_main_spec()
+    c8_indexer = _make_sfa_indexer_spec()
+    bf16_indexer = AscendSFAIndexerCacheSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.bfloat16,
+    )
+    specs = {
+        **{f"model.layers.{layer}.self_attn.attn": main_spec for layer in range(7)},
+        **{
+            f"model.layers.{layer}.self_attn.indexer.k_cache": c8_indexer
+            for layer in (1, 4)
+        },
+        **{
+            f"model.layers.{layer}.self_attn.indexer.k_cache": bf16_indexer
+            for layer in (2, 5)
+        },
+    }
+
+    layout = build_layerwise_reuse_layout(
+        specs,
+        7,
+        {"layerwise_num_shared_buffers": 1},
+    )
+
+    assert layout.buffer_slots == ((0,), (1, 3, 4, 6), (2, 5))
+    assert layout.prefetch_layer_map == {3: 1, 4: 3, 6: 4, 5: 2}
+
+
 def test_cache_spec_roles_do_not_depend_on_order():
     main_spec = _make_sfa_main_spec()
     indexer_spec = _make_sfa_indexer_spec()
