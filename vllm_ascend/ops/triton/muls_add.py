@@ -22,7 +22,9 @@ def muls_add_kernel(
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask)
         y = tl.load(y_ptr + offsets, mask=mask)
-        output = x * scale + y
+        #output = x * scale + y
+        scaled = (x.to(tl.float32) * scale).to(x.dtype)
+        output = scaled.to(tl.float32) + y.to(tl.float32)
         tl.store(output_ptr + offsets, output, mask=mask)
 
 

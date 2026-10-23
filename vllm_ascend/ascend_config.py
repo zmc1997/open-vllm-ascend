@@ -174,6 +174,7 @@ class AscendConfig:
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
         self.enable_sleep_mode_extra_cleanup = additional_config.get("enable_sleep_mode_extra_cleanup", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
+        self.mtp_metadata_overlap = additional_config.get("mtp_metadata_overlap", False)
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
 
         self.enable_fused_mc2 = self._get_config_value(
@@ -285,6 +286,11 @@ class AscendConfig:
 
         self.enable_sparse_sfa_c8 = additional_config.get("enable_sparse_sfa_c8", False) and use_sparse
         self.enable_sparse_li_c8 = additional_config.get("enable_sparse_li_c8", False) and use_sparse
+        self.sparse_li_c8_all_layers = additional_config.get("sparse_li_c8_all_layers", False)
+        if not isinstance(self.sparse_li_c8_all_layers, bool):
+            raise TypeError("sparse_li_c8_all_layers must be a bool.")
+        if self.sparse_li_c8_all_layers and not self.enable_sparse_li_c8:
+            raise ValueError("sparse_li_c8_all_layers requires enable_sparse_li_c8 on an SFA model.")
         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
             "c8_enable_reshape_optim", False
         )
@@ -476,6 +482,8 @@ class AscendConfig:
     def is_sparse_li_c8_layer(self, layer_name: str | None) -> bool:
         if not self.enable_sparse_li_c8:
             return False
+        if self.sparse_li_c8_all_layers:
+            return True
         if not self._sparse_li_c8_layer_filter_enabled:
             return True
         if layer_name is None:
