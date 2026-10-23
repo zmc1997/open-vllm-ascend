@@ -533,8 +533,8 @@ def main():
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        os.environ["MF_ACC_OFFLOAD_STORE_URL"] = f"tcp://127.0.0.1:{port}"
         cfg = offload.OffloadConfig()
+        cfg.store_url = f"tcp://127.0.0.1:{port}"
         cfg.device_id, cfg.reserve_size, cfg.alloc_size = args.device, 1 << 30, 1 << 30
         cfg.world_size, cfg.rank_id, cfg.scene = 1, 0, offload.Scene.SHARED
         rc = offload.initialize(cfg)
