@@ -43,6 +43,7 @@ def test_kimi_k3_identity_mla_rope_does_not_index_position_cache(monkeypatch):
     monkeypatch.setattr("vllm_ascend.ops.rotary_embedding._sin_mla", identity_sin)
     monkeypatch.setattr("vllm_ascend.ops.rotary_embedding._cos_cache", None)
     monkeypatch.setattr("vllm_ascend.ops.rotary_embedding._sin_cache", None)
+    monkeypatch.setattr("vllm_ascend.ops.rotary_embedding._cos_sin_flat", None)
 
     # Large absolute positions prove that K3 slices by token count rather
     # than indexing a position-dependent RoPE cache.

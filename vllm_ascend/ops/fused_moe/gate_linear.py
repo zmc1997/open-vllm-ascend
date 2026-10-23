@@ -19,7 +19,19 @@ from __future__ import annotations
 
 import torch
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
-from vllm.model_executor.layers.linear import ReplicatedLinear
+#from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ReplicatedLinear, UnquantizedLinearMethod
+
+class AscendGateLinearMethod(UnquantizedLinearMethod):
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if getattr(layer, "precast_fp32_weight", False):
+            if layer.weight.dtype != torch.float32:
+                raise RuntimeError("Internal Ascend router requires FP32 gate weights")
+            # Keep the existing FP32 weight and its layout. The internal router
+            # uses this attribute to select the multistream execution path.
+            layer.weight_fp32 = layer.weight.data
+
 
 
 class AscendGateLinear(GateLinear):
@@ -50,6 +62,9 @@ class AscendGateLinear(GateLinear):
             force_fp32_compute=True,
             prefix=prefix,
         )
+        
+        self.precast_fp32_weight = not bias
+        self.quant_method = AscendGateLinearMethod()
 
     def forward(self, x: torch.Tensor):
         # TODO: Remove this workaround after upgrading to a vLLM version that

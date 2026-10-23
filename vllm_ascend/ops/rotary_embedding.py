@@ -53,6 +53,7 @@ _cos_mla: torch.Tensor = None
 _sin_mla: torch.Tensor = None
 _cos_cache: torch.Tensor = None
 _sin_cache: torch.Tensor = None
+_cos_sin_flat: torch.Tensor | None = None
 _cos_sin_cache: torch.Tensor = None
 _cos: torch.Tensor = None
 _sin: torch.Tensor = None
@@ -90,8 +91,16 @@ def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, devi
 def get_cos_and_sin_mla(positions, use_cache=False):
     global _cos_cache
     global _sin_cache
-    cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
-    sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
+    global _cos_sin_flat
+    if _cos_sin_flat is not None:
+        # Fast path: row-gather from the contiguous interleaved base instead of
+        # the strided per-half views (avoids the per-lookup full-cache copy).
+        even_positions = positions * 2
+        cos = _cos_sin_flat[even_positions].unsqueeze(1).unsqueeze(2)
+        sin = _cos_sin_flat[even_positions + 1].unsqueeze(1).unsqueeze(2)
+    else:
+        cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
+        sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
     if not use_cache:
         return cos, sin
     global _cos_mla
@@ -126,19 +135,30 @@ def _record_cos_sin_cache(cos_sin_cache):
 def _record_cos_and_sin_cache(cos_cache, sin_cache):
     global _cos_cache
     global _sin_cache
+    global _cos_sin_flat
     _cos_cache = cos_cache
     _sin_cache = sin_cache
+    # This registration unconditionally overwrites the half-table globals; drop
+    # the interleaved flat view so the fast path cannot read a stale buffer.
+    _cos_sin_flat = None
 
 
 def _record_cos_and_sin_cache_interleaved(cos_sin_cache):
     global _cos_cache
     global _sin_cache
+    global _cos_sin_flat
     if _cos_cache is not None or _sin_cache is not None:
         return
     hidden_dim = cos_sin_cache.shape[-1] // 2
-    cos_cache, sin_cache = cos_sin_cache.view(-1, 2, hidden_dim).repeat(1, 1, 2).chunk(2, dim=1)
+    repeated = cos_sin_cache.view(-1, 2, hidden_dim).repeat(1, 1, 2)
+    cos_cache, sin_cache = repeated.chunk(2, dim=1)
     _cos_cache = cos_cache.squeeze(1)
     _sin_cache = sin_cache.squeeze(1)
+    # Contiguous flat view of the interleaved buffer: _cos_cache[i] == flat[2i]
+    # and _sin_cache[i] == flat[2i + 1]. Indexing the strided per-half views
+    # makes aclnnIndex materialize the whole cache per lookup; the flat base is
+    # contiguous so the same row gather is a plain copy.
+    _cos_sin_flat = repeated.view(-1, repeated.shape[-1])
 
 
 def update_cos_sin(positions):

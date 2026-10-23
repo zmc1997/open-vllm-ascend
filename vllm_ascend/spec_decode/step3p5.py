@@ -505,6 +505,8 @@ class AscendStep3p5MTPProposer(AscendEagleProposer):
         multi_steps_attn_metadata,
         num_tokens,
         is_prefill=None,
+        metadata_events=None,
+        window_events=None,
     ) -> torch.Tensor:
         """Base MTP execution flow with Step3.5 step-aware layer/head selection."""
         self._last_draft_probs = None
