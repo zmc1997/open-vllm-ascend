@@ -29,6 +29,73 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 
 
 @pytest.mark.parametrize(
+    "case",
+    ["enabled", "disabled", "missing_library_flag", "cross_host", "producer", "custom_connector",
+     "other_connector", "rdma", "other_backend", "copy_sfa", "a2", "invalid_bool",
+     "mixed_enabled", "mixed_disabled", "peer_invalid_bool"],
+)
+def test_unrestricted_cpu_pool_requires_local_sdma_pull(case):
+    extra = {"memfabric_unrestricted_cpu_pool": case not in ("disabled", "mixed_disabled")}
+    transfer = SimpleNamespace(
+        kv_connector="SfaRemoteD2HConnector", kv_connector_module_path=None,
+        kv_role="kv_consumer", kv_connector_extra_config=extra,
+    )
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.vllm_config = SimpleNamespace(kv_transfer_config=transfer)
+    manager.tp_size = 4
+    manager.tp_group = SimpleNamespace(cpu_group=object())
+    manager.use_fused_overlap = case != "copy_sfa"
+    config = SimpleNamespace(flags=0, local_world_size=0)
+    library = SimpleNamespace(OFFLOAD_FLAG_SHARED_LOCAL_UNRESTRICTED=2)
+    if case == "missing_library_flag":
+        del library.OFFLOAD_FLAG_SHARED_LOCAL_UNRESTRICTED
+    if case == "producer":
+        transfer.kv_role = "kv_producer"
+    if case == "custom_connector":
+        transfer.kv_connector_module_path = "custom.connector"
+    if case == "other_connector":
+        transfer.kv_connector = "MultiConnector"
+    if case == "rdma":
+        extra["memfabric_transfer_protocol"] = "device_rdma"
+    if case == "other_backend":
+        extra["transfer_backend"] = "mooncake"
+    if case == "invalid_bool":
+        extra["memfabric_unrestricted_cpu_pool"] = "invalid"
+    device = manager_module.AscendDeviceType.A2 if case == "a2" else manager_module.AscendDeviceType.A3
+
+    def gather_modes(output, value, *, group):
+        assert group is manager.tp_group.cpu_group
+        assert value == extra["memfabric_unrestricted_cpu_pool"]
+        output[:] = [value] * manager.tp_size
+        if case in ("mixed_enabled", "mixed_disabled"):
+            output[:] = [True, False, True, False]
+        elif case == "peer_invalid_bool":
+            output[-1] = "invalid"
+
+    with (
+        patch.object(manager_module, "offload", library, create=True),
+        patch.object(manager_module, "get_ascend_device_type", return_value=device),
+        patch.object(manager_module.torch.distributed, "all_gather_object", side_effect=gather_modes) as gather,
+        patch.object(manager_module, "in_the_same_node_as", return_value=[True] * 3 + [case != "cross_host"]) as same_node,
+    ):
+        if case in ("enabled", "disabled"):
+            manager._configure_unrestricted_cpu_pool(config)
+            assert config.flags == (2 if case == "enabled" else 0)
+            assert config.local_world_size == (4 if case == "enabled" else 0)
+            if case == "enabled":
+                same_node.assert_called_once_with(manager.tp_group.cpu_group, source_rank=0)
+            else:
+                same_node.assert_not_called()
+        else:
+            with pytest.raises((ValueError, RuntimeError)):
+                manager._configure_unrestricted_cpu_pool(config)
+            assert config.flags == 0
+            if case in ("mixed_enabled", "mixed_disabled", "invalid_bool", "peer_invalid_bool"):
+                same_node.assert_not_called()
+        gather.assert_called_once()
+
+
+@pytest.mark.parametrize(
     ("capturing", "runtime_mode", "expected"),
     [
         (False, CUDAGraphMode.NONE, False),

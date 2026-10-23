@@ -6,6 +6,8 @@ operators keep the original fixed epsilon=1e-6. This is
 an operator consistency test, not a performance or accuracy-dataset test.
 CPU pools use the production memfabric SHARED allocation, not mocked/pinned
 torch tensors. A separate NPU stream reads them via offload.sparse_copy.
+Pass --unrestricted-cpu-pool to select the opt-in A3 local SHARED allocator.
+The pool still has one rank; this does not test peer imports or PD transfers.
 
 Run explicitly with the model's NPU Python environment (not pytest collection)::
 
@@ -505,12 +507,18 @@ def main():
     parser.add_argument("--heads", nargs="+", type=int, choices=(16, 32), default=[16, 32])
     parser.add_argument("--tokens", nargs="+", type=int, choices=(1, 6, 32), default=[1, 6])
     parser.add_argument("--layer", type=int, default=0)
+    parser.add_argument(
+        "--unrestricted-cpu-pool",
+        action="store_true",
+        help="Use the opt-in MF A3 single-machine SHARED UNRESTRICTED CPU pool",
+    )
     args = parser.parse_args()
     assert not args.output.exists(), ("refusing to overwrite result", args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "status": "failed",
         "test_sha256": sha256(__file__),
+        "unrestricted_cpu_pool": args.unrestricted_cpu_pool,
         "cases": [],
         "weight_provenance": [],
         "scope": (
@@ -537,6 +545,14 @@ def main():
         cfg.store_url = f"tcp://127.0.0.1:{port}"
         cfg.device_id, cfg.reserve_size, cfg.alloc_size = args.device, 1 << 30, 1 << 30
         cfg.world_size, cfg.rank_id, cfg.scene = 1, 0, offload.Scene.SHARED
+        if args.unrestricted_cpu_pool:
+            cfg.flags = offload.OFFLOAD_FLAG_SHARED_LOCAL_UNRESTRICTED
+            cfg.local_world_size = 1
+        result["cpu_pool"] = {
+            "flags": int(cfg.flags),
+            "world_size": cfg.world_size,
+            "local_world_size": cfg.local_world_size,
+        }
         rc = offload.initialize(cfg)
         assert rc == 0, ("offload.initialize", rc)
         initialized = True
