@@ -1133,10 +1133,23 @@ class SparseKVOffloadManager:
         v: torch.Tensor | None,
         has_prefill: bool = False,
         capturing: bool = False,
+        writeback_in_producer: bool = False,
     ) -> None:
+        if writeback_in_producer and (has_prefill or not self.use_fused_overlap or k is None or v is None):
+            raise ValueError("Producer KV writeback requires current decode KV in fused-overlap mode")
+        if writeback_in_producer and self.tp_rank == 0 and (k_cache_cpu is None or v_cache_cpu is None):
+            raise ValueError("Producer KV writeback requires registered CPU KV pools on TP0")
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
             self.current_kv_by_layer[layer_id] = (k, v)
+        if writeback_in_producer:
+            # The producer's completion includes all mapped-CPU MTE3 stores.
+            # Keep the existing save-stream dependency used by TP/FSA consumers.
+            if self.tp_rank == 0 and capturing:
+                current_kv_ready = torch_npu.npu.current_stream().record_event()
+                with torch_npu.npu.stream(self.current_kv_save_stream):
+                    self.current_kv_save_stream.wait_event(current_kv_ready)
+            return
         if (
             capturing
             and not has_prefill
@@ -1681,10 +1694,7 @@ class SparseKVOffloadManager:
             raise RuntimeError(f"current decode K/V is unavailable for fused layer {layer_name}")
         if capturing or self.fused_async_plan:
             torch_npu.npu.current_stream().wait_stream(self.fused_plan_stream)
-        if self.tp_rank == 0 and capturing:
-            torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
-        if capturing and self.tp_size > 1 and layer_id != self.fused_overlap_plan_owner_layer_id:
-            self.tp_group.broadcast(self.fused_plan_status_npu, src=0)
+
         current_k, current_rope = current_kv
         current_k = current_k.reshape(-1, selection_kv_cache.shape[-1])[:num_tokens]
         current_rope = current_rope.reshape(-1, selection_k_rope.shape[-1])[:num_tokens]
@@ -1693,10 +1703,15 @@ class SparseKVOffloadManager:
         flat_kv = selection_kv_cache.reshape(-1, selection_kv_cache.shape[-1])
         flat_rope = selection_k_rope.reshape(-1, selection_k_rope.shape[-1])
         paired_scatter = getattr(self, "fused_current_scatter", None)
-        if paired_scatter is not None and paired_scatter(linear_slots, current_k, current_rope, flat_kv, flat_rope):
-            return
-        torch_npu.npu_scatter_nd_update_(flat_kv, indices, current_k)
-        torch_npu.npu_scatter_nd_update_(flat_rope, indices, current_rope)
+        if paired_scatter is None or not paired_scatter(linear_slots, current_k, current_rope, flat_kv, flat_rope):
+            torch_npu.npu_scatter_nd_update_(flat_kv, indices, current_k)
+            torch_npu.npu_scatter_nd_update_(flat_rope, indices, current_rope)
+        # Scatter reads current NPU KV and can overlap CPU writeback. Keep the
+        # barrier before FSA: other tokens in the MTP suffix can read the CPU pool.
+        if self.tp_rank == 0 and capturing:
+            torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
+        if capturing and self.tp_size > 1 and layer_id != self.fused_overlap_plan_owner_layer_id:
+            self.tp_group.broadcast(self.fused_plan_status_npu, src=0)
 
     def wait_for_current_kv_writeback(self, capturing: bool = False) -> None:
         if self.use_fused_overlap and capturing and self.tp_rank == 0:
