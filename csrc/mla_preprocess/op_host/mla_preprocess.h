@@ -12,9 +12,17 @@
 //
 
 #include <fstream>
+#include <atomic>
 #include <iostream>
+#include <cstring>
+#include <map>
+#include <memory>
 #include <math.h>
+#include <mutex>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
+#include <vector>
 #include "acl/acl.h"
 // #include "defines.h"
 // #include "torch_helper.h"
@@ -130,6 +138,7 @@ struct OpParam {
     caffe2::TypeMeta inDtype;
     bool enableInnerOut;
     bool enableRope;
+    bool directOutput{false};
     // MLA dimensions derived from tensor shapes
     uint32_t qLoraRank;
     uint32_t qkNopeHeadDim;
@@ -555,7 +564,9 @@ void MlaPreprocessTiling::SetMlapoWorkSpace()
 
 void MlaPreprocessTiling::SetTilingKey()
 {
-    uint64_t tilingKey = (static_cast<uint64_t>(opParam.enableInnerOut)) << 9;
+    // Bits 0..2: cache mode; 3..4: quant mode; 8: BF16; 9: inner Q; 10: direct KV output.
+    uint64_t tilingKey = (static_cast<uint64_t>(opParam.directOutput)) << 10;
+    tilingKey |= (static_cast<uint64_t>(opParam.enableInnerOut)) << 9;
     tilingKey |= (static_cast<uint64_t>(opParam.inDtype == at::kBFloat16)) << 8;
 
     tilingKey |= static_cast<uint64_t>(opParam.cacheMode);
@@ -736,7 +747,121 @@ inline uint32_t GetRopeHeadDim(const at::Tensor &kv_cache_rope, int32_t cacheMod
     return static_cast<uint32_t>(sizes.back());
 }
 
-std::tuple<at::Tensor, at::Tensor, uint32_t> mla_preprocess_tiling(
+struct MlaTilingBuffers {
+    at::Tensor host;
+    at::Tensor device;
+    std::mutex initialization_mutex;
+    std::atomic<bool> device_ready{false};
+};
+
+inline void RequireMlaTilingOutsideCapture(aclrtStream stream)
+{
+    aclmdlRICaptureStatus status;
+    aclmdlRI model = nullptr;
+    const aclError ret = aclmdlRICaptureGetInfo(stream, &status, &model);
+    TORCH_CHECK(ret == ACL_SUCCESS, "MLAPO tiling capture query failed: ", ret);
+    TORCH_CHECK(status == ACL_MODEL_RI_CAPTURE_STATUS_NONE,
+                "MLAPO tiling was not prepared before graph capture; warm the exact "
+                "shape/mode/CPU-pool configuration outside capture first");
+}
+
+inline void InitializeMlaTiling(const std::shared_ptr<MlaTilingBuffers> &buffers, aclrtStream stream)
+{
+    if (buffers->device_ready.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(buffers->initialization_mutex);
+    if (buffers->device_ready.load(std::memory_order_acquire)) {
+        return;
+    }
+    // Use the actual launch stream: OpCommand may execute on a queue thread.
+    RequireMlaTilingOutsideCapture(stream);
+    aclError ret = aclrtMemcpyAsync(buffers->device.data_ptr(), sizeof(MlaTilingData),
+                                  buffers->host.data_ptr(), sizeof(MlaTilingData),
+                                  ACL_MEMCPY_HOST_TO_DEVICE, stream);
+    TORCH_CHECK(ret == ACL_SUCCESS, "MLAPO initial tiling H2D failed: ", ret);
+    ret = aclrtSynchronizeStream(stream);
+    TORCH_CHECK(ret == ACL_SUCCESS, "MLAPO initial tiling completion failed: ", ret);
+    // Only completed device contents may be reused, including by captured graphs.
+    buffers->device_ready.store(true, std::memory_order_release);
+}
+
+inline auto MakeMlaTilingKey(const at::Tensor &hiddenState, const at::Tensor &wdqkv,
+                            const at::Tensor &wuk, const at::Tensor &kv_cache,
+                            const at::Tensor &kv_cache_rope, const OpParam &opParam,
+                            const MlaTilingData &tilingData, const PlatformInfo &platformInfo,
+                            aclrtStream stream)
+{
+    return std::make_tuple(
+        hiddenState.device().index(), reinterpret_cast<uintptr_t>(stream),
+        hiddenState.scalar_type(), wdqkv.scalar_type(), wuk.scalar_type(),
+        kv_cache.scalar_type(), kv_cache_rope.scalar_type(),
+        opParam.isWeightQuantized, opParam.hiddenStateDim, opParam.N, opParam.headNum,
+        opParam.cacheMode, opParam.quantMode, opParam.enableInnerOut, opParam.enableRope, opParam.directOutput,
+        opParam.qLoraRank, opParam.qkNopeHeadDim, opParam.qkRopeHeadDim, opParam.kvLoraRank,
+        opParam.kvCacheBlockSize, opParam.kvCacheStride0, opParam.kvCacheRopeStride0,
+        tilingData.writebackKBase, tilingData.writebackRopeBase, tilingData.writebackCapacity,
+        platformInfo.coreNum, platformInfo.coreNumAic, platformInfo.coreNumAiv,
+        platformInfo.ubSize, platformInfo.l1Size, platformInfo.l2Size,
+        platformInfo.l0aSize, platformInfo.l0bSize, platformInfo.l0cSize);
+}
+
+using MlaTilingKey = decltype(MakeMlaTilingKey(
+    std::declval<const at::Tensor &>(), std::declval<const at::Tensor &>(),
+    std::declval<const at::Tensor &>(), std::declval<const at::Tensor &>(),
+    std::declval<const at::Tensor &>(), std::declval<const OpParam &>(),
+    std::declval<const MlaTilingData &>(), std::declval<const PlatformInfo &>(),
+    std::declval<aclrtStream>()));
+
+struct MlaTilingCache {
+    std::mutex mutex;
+    std::map<MlaTilingKey, std::shared_ptr<MlaTilingBuffers>> entries;
+};
+
+inline MlaTilingCache &GetMlaTilingCache()
+{
+    // ponytail: retain buffers until process exit; eviction needs graph lifetimes.
+    static auto *cache = new MlaTilingCache();
+    return *cache;
+}
+
+inline int64_t PrepareMlaTilingForCapture()
+{
+    const auto device = c10_npu::current_device();
+    const auto stream = c10_npu::getCurrentNPUStream().stream();
+    RequireMlaTilingOutsideCapture(stream);
+    auto &cache = GetMlaTilingCache();
+    std::map<MlaTilingKey, std::shared_ptr<MlaTilingBuffers>> prepared;
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        // Snapshot before inserting: preserve the complete key except its stream.
+        const std::vector<std::pair<MlaTilingKey, std::shared_ptr<MlaTilingBuffers>>>
+            sources(cache.entries.begin(), cache.entries.end());
+        for (const auto &source : sources) {
+            if (std::get<0>(source.first) != device) {
+                continue;
+            }
+            auto key = source.first;
+            std::get<1>(key) = reinterpret_cast<uintptr_t>(stream);
+            auto found = cache.entries.find(key);
+            if (found == cache.entries.end()) {
+                auto buffers = std::make_shared<MlaTilingBuffers>();
+                // Host tiling is immutable; device storage remains stream-local.
+                buffers->host = source.second->host;
+                buffers->device = at::empty_like(source.second->device);
+                found = cache.entries.emplace(key, std::move(buffers)).first;
+            }
+            prepared.emplace(key, found->second);
+        }
+    }
+    // Never hold the map lock while waiting for device completion.
+    for (const auto &entry : prepared) {
+        InitializeMlaTiling(entry.second, stream);
+    }
+    return static_cast<int64_t>(prepared.size());
+}
+
+std::tuple<at::Tensor, std::shared_ptr<MlaTilingBuffers>, uint32_t> mla_preprocess_tiling(
     const at::Tensor &hiddenState,
     const at::Tensor &wdqkv,
     const at::Tensor &wuk,
@@ -746,7 +871,11 @@ std::tuple<at::Tensor, at::Tensor, uint32_t> mla_preprocess_tiling(
     c10::optional<c10::string_view> cache_mode,
     c10::optional<c10::string_view> quant_mode,
     bool enable_inner_out,
-    bool enable_rope
+    bool enable_rope,
+    bool direct_output = false,
+    int64_t writeback_k_base = 0,
+    int64_t writeback_rope_base = 0,
+    int64_t writeback_capacity = 0
 )
 {
     auto cacheMode = get_op_mode(cache_mode_map, cache_mode, "krope_ctkv", "cache_mode");
@@ -766,6 +895,8 @@ std::tuple<at::Tensor, at::Tensor, uint32_t> mla_preprocess_tiling(
     platformAscendC->GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, platformInfo.l0cSize);
 
     int32_t N = hiddenState.sizes()[0];
+    TORCH_CHECK(N > 0 && N <= MAX_SUPPORT_TOKEN_NUMS,
+                "mla_preprocess token count must be in [1, ", MAX_SUPPORT_TOKEN_NUMS, "], got ", N);
     int32_t headNum = wuk.sizes()[0];
     uint32_t hiddenStateDim = hiddenState.sizes().back();
 
@@ -790,11 +921,14 @@ std::tuple<at::Tensor, at::Tensor, uint32_t> mla_preprocess_tiling(
                 "quant_mode=per_token_quant_symm only supports bf16 input, got ", opParam.inDtype);
     opParam.enableInnerOut = enable_inner_out;
     opParam.enableRope = enable_rope;
+    opParam.directOutput = direct_output;
     opParam.qLoraRank = qLoraRank;
     opParam.qkNopeHeadDim = qkNopeHeadDim;
     opParam.qkRopeHeadDim = qkRopeHeadDim;
     opParam.kvLoraRank = kvLoraRank;
-    opParam.kvCacheBlockSize = GetKvCacheBlockSize(kv_cache, static_cast<int32_t>(cacheMode));
+    // Direct output tensors are [N, width], not paged caches. These fields are
+    // unused by its compile-time kernel branch; do not interpret width as block size.
+    opParam.kvCacheBlockSize = direct_output ? 0 : GetKvCacheBlockSize(kv_cache, static_cast<int32_t>(cacheMode));
     opParam.kvCacheStride0 = GetTensorStride0(kv_cache);
     opParam.kvCacheRopeStride0 = GetTensorStride0(kv_cache_rope);
     if (wdqkv.options().dtype() == at::kBFloat16 || wdqkv.options().dtype() == at::kHalf) {
@@ -807,6 +941,9 @@ std::tuple<at::Tensor, at::Tensor, uint32_t> mla_preprocess_tiling(
     MlaPreprocessTiling mlaTiling(platformInfo, opParam, &tilingData);
 
     mlaTiling.Init();
+    tilingData.writebackKBase = static_cast<uint64_t>(writeback_k_base);
+    tilingData.writebackRopeBase = static_cast<uint64_t>(writeback_rope_base);
+    tilingData.writebackCapacity = static_cast<uint64_t>(writeback_capacity);
     uint32_t blockDim = platformInfo.coreNumAic;
 
     // workspace
@@ -815,25 +952,24 @@ std::tuple<at::Tensor, at::Tensor, uint32_t> mla_preprocess_tiling(
     auto options = at::TensorOptions().dtype(at::kByte).device(hiddenState.options().device());
     auto workspace_tensor = at::empty({static_cast<int64_t>(workspace_size)}, options);
 
-    // tiling
-    int32_t bIndex = N - 1;
-    uint32_t tilingSize = sizeof(MlaTilingData);
-    static auto global_tiling_data =
-        at::empty({tilingSize * MAX_SUPPORT_TOKEN_NUMS},
-                  at::TensorOptions().dtype(at::kByte).device(hiddenState.options().device()));
-    if (bIndex >= 0 && bIndex < MAX_SUPPORT_TOKEN_NUMS) {
-        aclrtMemcpy(global_tiling_data.data_ptr<uint8_t>() + (tilingSize * bIndex), tilingSize, &tilingData, tilingSize,
-                    ACL_MEMCPY_HOST_TO_DEVICE);
-    } else {
-        // Handle the case where bIndex is out of range
-        TORCH_CHECK(false, "bIndex is out of range: ", bIndex);
+    // Device tiling is immutable after one completed initialization per entry.
+    const auto stream = c10_npu::getCurrentNPUStream().stream();
+    auto key = MakeMlaTilingKey(hiddenState, wdqkv, wuk, kv_cache, kv_cache_rope,
+                               opParam, tilingData, platformInfo, stream);
+    auto &cache = GetMlaTilingCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto entry = cache.entries.find(key);
+    if (entry == cache.entries.end()) {
+        // Cold capture is rejected before allocating graph-owned tiling storage.
+        RequireMlaTilingOutsideCapture(stream);
+        const int64_t tilingSize = sizeof(MlaTilingData);
+        auto buffers = std::make_shared<MlaTilingBuffers>();
+        buffers->host = at::empty({tilingSize}, options.device(at::kCPU).pinned_memory(true));
+        buffers->device = at::empty({tilingSize}, options);
+        std::memcpy(buffers->host.data_ptr(), &tilingData, sizeof(MlaTilingData));
+        entry = cache.entries.emplace(key, std::move(buffers)).first;
     }
-    at::Tensor tiling = at::from_blob(
-        global_tiling_data.data_ptr<uint8_t>() + (tilingSize * bIndex),
-        tilingSize,
-        at::kByte);
-
-    return std::make_tuple(workspace_tensor, tiling, blockDim);
+    return std::make_tuple(workspace_tensor, entry->second, blockDim);
 }
 
 }  // namespace npu_kernel

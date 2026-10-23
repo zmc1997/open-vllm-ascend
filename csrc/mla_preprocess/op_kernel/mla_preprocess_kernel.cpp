@@ -20,24 +20,14 @@
 
 #include "../op_host/tiling/mla_preprocess_tiling.h"
 
-extern "C" __global__ __aicore__ void mla_preprocess(
+template <bool DirectOutput>
+__aicore__ __force_inline__ void RunMlaPreprocess(
     GM_ADDR hiddenState, GM_ADDR quantScale1, GM_ADDR quantOffset1, GM_ADDR wdqkv,
     GM_ADDR bias1, GM_ADDR gamma2, GM_ADDR beta2, GM_ADDR quantScale2, GM_ADDR quantOffset2, GM_ADDR gamma3,
     GM_ADDR sin1, GM_ADDR cos1, GM_ADDR sin2, GM_ADDR cos2, GM_ADDR keycache, GM_ADDR slotMapping, GM_ADDR wuq,
     GM_ADDR bias2, GM_ADDR wuk, GM_ADDR descale1, GM_ADDR descale2, GM_ADDR ctkvScale, GM_ADDR qnopeScale, GM_ADDR q,
     GM_ADDR keycacheOut, GM_ADDR q2, GM_ADDR keycacheOut2, GM_ADDR innerOut, GM_ADDR workspace, GM_ADDR tiling)
 {
-#if defined(__CCE_KT_TEST__) || (__CCE_AICORE__ == 220)
-    PRELOAD(2);
-#endif
-
-    SetAtomicnone();
-    SetMasknorm();
-#ifdef __DAV_C220_CUBE__
-    SetPadding<uint64_t>((uint64_t)0);
-    SetNdpara(1, 0, 0);
-#endif
-
     MlaTilingData mlaTilingData;
     __gm__ MlaTilingData *tilingData = reinterpret_cast<__gm__ MlaTilingData *>(tiling);
 
@@ -45,6 +35,9 @@ extern "C" __global__ __aicore__ void mla_preprocess(
     mlaTilingData.n = tilingData->n;
     mlaTilingData.hiddenStateDim = tilingData->hiddenStateDim;
     mlaTilingData.enableRope = tilingData->enableRope;
+    mlaTilingData.writebackKBase = tilingData->writebackKBase;
+    mlaTilingData.writebackRopeBase = tilingData->writebackRopeBase;
+    mlaTilingData.writebackCapacity = tilingData->writebackCapacity;
 
     mlaTilingData.mm1.numBatch = tilingData->mm1.numBatch;
     mlaTilingData.mm1.m = tilingData->mm1.m;
@@ -158,7 +151,21 @@ extern "C" __global__ __aicore__ void mla_preprocess(
     GM_ADDR s4 = workspace + static_cast<uint64_t>(mlaTilingData.s4Offset);
     GM_ADDR s5 = workspace + static_cast<uint64_t>(mlaTilingData.s5Offset);
 
-    switch (mlaTilingData.tilingKey) {
+    if constexpr (DirectOutput) {
+        MLAPO_BF16_INNER::MLAOperation<__bf16, 1, DataFormat::NZ, DataFormat::NZ, DataFormat::ND,
+                                 QuantMode::PER_TENSOR_ASYMM_QUANT, true>
+            opBf16Direct(mlaTilingData, tiling);
+        opBf16Direct.Init(hiddenState, quantScale1, quantOffset1, wdqkv, bias1, gamma2, beta2,
+                          quantScale2, quantOffset2, gamma3, sin1, cos1, sin2, cos2, keycache, slotMapping, wuq,
+                          bias2, wuk, descale1, descale2, ctkvScale, qnopeScale, q, keycacheOut, q2, keycacheOut2,
+                          s1, s2, s3, s4, s5, innerOut);
+        if ASCEND_IS_AIC {
+            opBf16Direct.ProcessCube();
+        }
+        if ASCEND_IS_AIV {
+            opBf16Direct.ProcessVector();
+        }
+    } else switch (mlaTilingData.tilingKey) {
         case KEY_FP16_CACHEMODE_0_QUANTMODE_0: {
             MLAPO_FP16::MLAOperation<CACHE_MODE_KVCACHE, DataFormat::NZ, DataFormat::NZ, DataFormat::ND> opFp16Cm0Qm0(
                 mlaTilingData, tiling);
@@ -435,6 +442,58 @@ extern "C" __global__ __aicore__ void mla_preprocess(
     return;
 }
 
+extern "C" __global__ __aicore__ void mla_preprocess(
+    GM_ADDR hiddenState, GM_ADDR quantScale1, GM_ADDR quantOffset1, GM_ADDR wdqkv,
+    GM_ADDR bias1, GM_ADDR gamma2, GM_ADDR beta2, GM_ADDR quantScale2, GM_ADDR quantOffset2, GM_ADDR gamma3,
+    GM_ADDR sin1, GM_ADDR cos1, GM_ADDR sin2, GM_ADDR cos2, GM_ADDR keycache, GM_ADDR slotMapping, GM_ADDR wuq,
+    GM_ADDR bias2, GM_ADDR wuk, GM_ADDR descale1, GM_ADDR descale2, GM_ADDR ctkvScale, GM_ADDR qnopeScale, GM_ADDR q,
+    GM_ADDR keycacheOut, GM_ADDR q2, GM_ADDR keycacheOut2, GM_ADDR innerOut, GM_ADDR workspace, GM_ADDR tiling)
+{
+#if defined(__CCE_KT_TEST__) || (__CCE_AICORE__ == 220)
+    PRELOAD(2);
+#endif
+
+    SetAtomicnone();
+    SetMasknorm();
+#ifdef __DAV_C220_CUBE__
+    SetPadding<uint64_t>((uint64_t)0);
+    SetNdpara(1, 0, 0);
+#endif
+
+    RunMlaPreprocess<false>(
+        hiddenState, quantScale1, quantOffset1, wdqkv, bias1, gamma2,
+        beta2, quantScale2, quantOffset2, gamma3, sin1, cos1,
+        sin2, cos2, keycache, slotMapping, wuq, bias2,
+        wuk, descale1, descale2, ctkvScale, qnopeScale, q,
+        keycacheOut, q2, keycacheOut2, innerOut, workspace, tiling);
+}
+
+extern "C" __global__ __aicore__ void mla_preprocess_direct(
+    GM_ADDR hiddenState, GM_ADDR quantScale1, GM_ADDR quantOffset1, GM_ADDR wdqkv,
+    GM_ADDR bias1, GM_ADDR gamma2, GM_ADDR beta2, GM_ADDR quantScale2, GM_ADDR quantOffset2, GM_ADDR gamma3,
+    GM_ADDR sin1, GM_ADDR cos1, GM_ADDR sin2, GM_ADDR cos2, GM_ADDR keycache, GM_ADDR slotMapping, GM_ADDR wuq,
+    GM_ADDR bias2, GM_ADDR wuk, GM_ADDR descale1, GM_ADDR descale2, GM_ADDR ctkvScale, GM_ADDR qnopeScale, GM_ADDR q,
+    GM_ADDR keycacheOut, GM_ADDR q2, GM_ADDR keycacheOut2, GM_ADDR innerOut, GM_ADDR workspace, GM_ADDR tiling)
+{
+#if defined(__CCE_KT_TEST__) || (__CCE_AICORE__ == 220)
+    PRELOAD(2);
+#endif
+
+    SetAtomicnone();
+    SetMasknorm();
+#ifdef __DAV_C220_CUBE__
+    SetPadding<uint64_t>((uint64_t)0);
+    SetNdpara(1, 0, 0);
+#endif
+
+    RunMlaPreprocess<true>(
+        hiddenState, quantScale1, quantOffset1, wdqkv, bias1, gamma2,
+        beta2, quantScale2, quantOffset2, gamma3, sin1, cos1,
+        sin2, cos2, keycache, slotMapping, wuq, bias2,
+        wuk, descale1, descale2, ctkvScale, qnopeScale, q,
+        keycacheOut, q2, keycacheOut2, innerOut, workspace, tiling);
+}
+
 namespace vllm_ascend {
 
 extern void mla_preprocess_impl(
@@ -472,6 +531,73 @@ extern void mla_preprocess_impl(
     const uint32_t block_dim)
 {
     mla_preprocess<<<block_dim, nullptr, stream>>>(
+        hidden_state,
+        quant_scale1,
+        quant_offset1,
+        wdqkv,
+        bias1,
+        gamma2,
+        beta2,
+        quant_scale2,
+        quant_offset2,
+        gamma3,
+        sin1,
+        cos1,
+        sin2,
+        cos2,
+        keycache,
+        slot_mapping,
+        wuq,
+        bias2,
+        wuk,
+        descale1,
+        descale2,
+        ctkv_scale,
+        qnope_scale,
+        q,
+        keycache_out,
+        q2,
+        keycache_out2,
+        inner_out,
+        workspace,
+        tiling);
+}
+
+extern void mla_preprocess_direct_impl(
+    void* stream,
+    void* hidden_state,
+    void* quant_scale1,
+    void* quant_offset1,
+    void* wdqkv,
+    void* bias1,
+    void* gamma2,
+    void* beta2,
+    void* quant_scale2,
+    void* quant_offset2,
+    void* gamma3,
+    void* sin1,
+    void* cos1,
+    void* sin2,
+    void* cos2,
+    void* keycache,
+    void* slot_mapping,
+    void* wuq,
+    void* bias2,
+    void* wuk,
+    void* descale1,
+    void* descale2,
+    void* ctkv_scale,
+    void* qnope_scale,
+    void* q,
+    void* keycache_out,
+    void* q2,
+    void* keycache_out2,
+    void* inner_out,
+    void* workspace,
+    void* tiling,
+    const uint32_t block_dim)
+{
+    mla_preprocess_direct<<<block_dim, nullptr, stream>>>(
         hidden_state,
         quant_scale1,
         quant_offset1,

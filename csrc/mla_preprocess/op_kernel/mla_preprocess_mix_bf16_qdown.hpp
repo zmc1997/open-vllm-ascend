@@ -2461,9 +2461,12 @@ __aicore__ __force_inline__ void PpMatmulW8a8Aiv<OutDtype, withSyncAll, quantMod
 
 template <typename InDtype, int8_t CACHE_MODE, DataFormat weightFormat1 = DataFormat::NZ,
           DataFormat weightFormat2 = DataFormat::NZ, DataFormat weightFormat3 = DataFormat::ND,
-          QuantMode quantMode = QuantMode::PER_TENSOR_ASYMM_QUANT>
+          QuantMode quantMode = QuantMode::PER_TENSOR_ASYMM_QUANT, bool DirectOutput = false>
 class MLAOperation
 {
+    static_assert(!DirectOutput || (CACHE_MODE == CACHE_MODE_KROPE_CTKV &&
+                  quantMode == QuantMode::PER_TENSOR_ASYMM_QUANT),
+                  "Direct KV output supports only the BF16 W8A8 separate-output path");
     static constexpr bool mm1WithSyncAll = (quantMode == QuantMode::PER_TOKEN_SYMM_QUANT);
     static constexpr uint64_t splitGapC = CACHE_MODE == CACHE_MODE_KVCACHE ? CONST_64 : CONST_0;
     using Q_OUT_DTYPE = typename std::conditional_t<CACHE_MODE == CACHE_MODE_INT8_NZCACHE, int8_t, InDtype>;
@@ -2494,16 +2497,18 @@ public:
         this->ropeSplitSizeTwo_ = mlaParams_.ropeSplitSizeTwo;
         this->hiddenStrideRope_ = mlaParams_.hiddenStrideRope;
         this->qkNopeHeadDim_ = mlaParams_.qkNopeHeadDim;
-        this->kv_cache_block_size_ = mlaParams_.kvCacheBlockSize == 0 ? 128U : mlaParams_.kvCacheBlockSize;
-        uint64_t defaultCacheStride0 = static_cast<uint64_t>(kv_cache_block_size_) *
-            (CACHE_MODE == CACHE_MODE_KVCACHE ? static_cast<uint64_t>(splitSizeOne_)
-                                              : static_cast<uint64_t>(splitRmsNormSizeOne_));
-        uint64_t defaultRopeStride0 =
-            static_cast<uint64_t>(kv_cache_block_size_) * static_cast<uint64_t>(splitRmsNormSizeTwo_);
-        this->kv_cache_stride0_ =
-            mlaParams_.kvCacheStride0 == 0 ? defaultCacheStride0 : mlaParams_.kvCacheStride0;
-        this->kv_cache_rope_stride0_ =
-            mlaParams_.kvCacheRopeStride0 == 0 ? defaultRopeStride0 : mlaParams_.kvCacheRopeStride0;
+        if constexpr (!DirectOutput) {
+            this->kv_cache_block_size_ = mlaParams_.kvCacheBlockSize == 0 ? 128U : mlaParams_.kvCacheBlockSize;
+            uint64_t defaultCacheStride0 = static_cast<uint64_t>(kv_cache_block_size_) *
+                (CACHE_MODE == CACHE_MODE_KVCACHE ? static_cast<uint64_t>(splitSizeOne_)
+                                                  : static_cast<uint64_t>(splitRmsNormSizeOne_));
+            uint64_t defaultRopeStride0 =
+                static_cast<uint64_t>(kv_cache_block_size_) * static_cast<uint64_t>(splitRmsNormSizeTwo_);
+            this->kv_cache_stride0_ =
+                mlaParams_.kvCacheStride0 == 0 ? defaultCacheStride0 : mlaParams_.kvCacheStride0;
+            this->kv_cache_rope_stride0_ =
+                mlaParams_.kvCacheRopeStride0 == 0 ? defaultRopeStride0 : mlaParams_.kvCacheRopeStride0;
+        }
     }
 
     __aicore__ inline void Init(GM_ADDR hiddenStateGm, GM_ADDR quantScale1Gm,
@@ -2521,7 +2526,13 @@ public:
         cos1GmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(cos1Gm));
         keycacheGmTensor1.SetGlobalBuffer(reinterpret_cast<__gm__ K_NOPE_DTYPE *>(keycacheOutGm));
         keycacheGmTensor2.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(keycacheOutGm2));
-        slotMappingGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(slotMappingGm));
+        if constexpr (!DirectOutput) {
+            slotMappingGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(slotMappingGm));
+        } else if (mlaParams.writebackCapacity != 0) {
+            writebackSlotsGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(slotMappingGm));
+            writebackKGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(mlaParams.writebackKBase));
+            writebackRopeGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(mlaParams.writebackRopeBase));
+        }
         descale1gmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(descale1Gm));
         s2GmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(s2Gm));
         s3GmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(s3Gm));
@@ -2655,9 +2666,11 @@ private:
         SET_FLAG(MTE2, V, EVENT_ID1);
         WAIT_FLAG(MTE2, V, EVENT_ID1);
         Cast(gammaFp32, gammaTensor, AscendC::RoundMode::CAST_NONE, splitRmsNormSizeOne_);
-        AscendC::DataCopyPad(slotMappingTensor, slotMappingGmTensor[slotMapGmOffset],
-                             AscendC::DataCopyExtParams(1, sN * sizeof(int32_t), 0, 0, 0),
-                             AscendC::DataCopyPadExtParams<int32_t>(false, 0, 8 - sN % 8, 0));
+        if constexpr (!DirectOutput) {
+            AscendC::DataCopyPad(slotMappingTensor, slotMappingGmTensor[slotMapGmOffset],
+                                 AscendC::DataCopyExtParams(1, sN * sizeof(int32_t), 0, 0, 0),
+                                 AscendC::DataCopyPadExtParams<int32_t>(false, 0, 8 - sN % 8, 0));
+        }
         if constexpr (quantMode == QuantMode::PER_TOKEN_SYMM_QUANT) {
             mmTensor = calTensor.ReinterpretCast<int32_t>()[splitSizeOne_];
             deScaleTensor = calTensor.ReinterpretCast<float>()[splitSizeOne_ * 2];
@@ -2665,13 +2678,18 @@ private:
         }
         SET_FLAG(MTE2, V, EVENT_ID2);
         WAIT_FLAG(MTE2, V, EVENT_ID2);
-        SET_FLAG(MTE2, S, EVENT_ID2);
-        WAIT_FLAG(MTE2, S, EVENT_ID2);
+        if constexpr (!DirectOutput) {
+            SET_FLAG(MTE2, S, EVENT_ID2);
+            WAIT_FLAG(MTE2, S, EVENT_ID2);
+        }
         for (uint64_t loop = 0; loop < sN; ++loop) {
             uint64_t offset = vectorBlockIdx * static_cast<uint64_t>(row_work) * num_col_2 + loop * mm1OutSize_;
-            int64_t slotValue = static_cast<int64_t>(slotMappingTensor.GetValue(loop));
-            if (slotValue == -1) {
-                continue;
+            int64_t slotValue = 0;
+            if constexpr (!DirectOutput) {
+                slotValue = static_cast<int64_t>(slotMappingTensor.GetValue(loop));
+                if (slotValue == -1) {
+                    continue;
+                }
             }
             if constexpr (quantMode == QuantMode::PER_TENSOR_ASYMM_QUANT) {
                 AscendC::DataCopy(srcTensor, s3GmTensor[offset],
@@ -2688,9 +2706,23 @@ private:
             }
             SET_FLAG(MTE2, V, EVENT_ID0);
             uint64_t cacheSlot = static_cast<uint64_t>(slotValue);
-            uint64_t cacheStart = GetCacheOffset(cacheSlot, splitSizeOne_, kv_cache_stride0_);
-            uint64_t cacheStart1 = GetCacheOffset(cacheSlot, splitRmsNormSizeOne_, kv_cache_stride0_);
-            uint64_t cacheStart2 = GetCacheOffset(cacheSlot, splitRmsNormSizeTwo_, kv_cache_rope_stride0_);
+            uint64_t cacheStart = 0;
+            uint64_t cacheStart1 = 0;
+            uint64_t cacheStart2 = 0;
+            int64_t writebackSlot = -1;
+            if constexpr (DirectOutput) {
+                // Current input order, with no slot read, page division or modulo.
+                const uint64_t token = static_cast<uint64_t>(vectorBlockIdx) * row_work + loop;
+                cacheStart1 = token * splitRmsNormSizeOne_;
+                cacheStart2 = token * splitRmsNormSizeTwo_;
+                if (mlaParams.writebackCapacity != 0) {
+                    writebackSlot = static_cast<int64_t>(writebackSlotsGmTensor.GetValue(token));
+                }
+            } else {
+                cacheStart = GetCacheOffset(cacheSlot, splitSizeOne_, kv_cache_stride0_);
+                cacheStart1 = GetCacheOffset(cacheSlot, splitRmsNormSizeOne_, kv_cache_stride0_);
+                cacheStart2 = GetCacheOffset(cacheSlot, splitRmsNormSizeTwo_, kv_cache_rope_stride0_);
+            }
 
             SET_FLAG(S, MTE3, EVENT_ID0);
             /* RmsNorm start */
@@ -2838,6 +2870,20 @@ private:
                 DataCopy(keycacheGmTensor2[cacheStart2], outTmpTensor[splitRmsNormSizeOne_],
                          splitRmsNormSizeTwo_);
             }
+            if constexpr (DirectOutput) {
+                if (writebackSlot >= 0 && static_cast<uint64_t>(writebackSlot) < mlaParams.writebackCapacity) {
+                    // Write the same final BF16 values; invalid business slots still
+                    // retain the NPU current-KV output used by paired_scatter.
+                    const uint64_t slot = static_cast<uint64_t>(writebackSlot);
+                    DataCopyPad(writebackKGmTensor[slot * splitRmsNormSizeOne_], outTmpTensor,
+                                AscendC::DataCopyExtParams(1, splitRmsNormSizeOne_ * sizeof(InDtype), 0, 0, 0));
+                    DataCopyPad(writebackRopeGmTensor[slot * splitRmsNormSizeTwo_],
+                                outTmpTensor[splitRmsNormSizeOne_],
+                                AscendC::DataCopyExtParams(1, splitRmsNormSizeTwo_ * sizeof(InDtype), 0, 0, 0));
+                }
+            }
+            // Both destinations must finish reading this UB before the next
+            // row or Q vector postprocessing reuses it. Cube MM2 is already running.
             SET_FLAG(MTE3, MTE2, EVENT_ID1);
             WAIT_FLAG(MTE3, MTE2, EVENT_ID1);
         }
@@ -2887,6 +2933,9 @@ private:
     AscendC::GlobalTensor<K_NOPE_DTYPE> keycacheGmTensor1;
     AscendC::GlobalTensor<InDtype> keycacheGmTensor2;
     AscendC::GlobalTensor<int32_t> slotMappingGmTensor;
+    AscendC::GlobalTensor<int32_t> writebackSlotsGmTensor;
+    AscendC::GlobalTensor<InDtype> writebackKGmTensor;
+    AscendC::GlobalTensor<InDtype> writebackRopeGmTensor;
     AscendC::GlobalTensor<int8_t> wuqGmTensor;
     AscendC::GlobalTensor<InDtype> wukGmTensor;
 
@@ -2918,16 +2967,17 @@ private:
 
     Quant<InDtype, true, false, quantMode, false> Quant1;
 
-    RmsNormQuant<InDtype, true, false, quantMode, quantMode == QuantMode::PER_TOKEN_SYMM_QUANT> rmsNormQuant2;
+    RmsNormQuant<InDtype, true, false, quantMode,
+                 quantMode == QuantMode::PER_TOKEN_SYMM_QUANT> rmsNormQuant2;
     RopeFp16<InDtype, InDtype, Q_OUT_DTYPE, CACHE_MODE> ropeFp16;
     EinSumQuant<InDtype, InDtype> einSumQuant;
 #endif
 };
 
 template <typename InDtype, int8_t CACHE_MODE, DataFormat weightFormat1, DataFormat weightFormat2,
-          DataFormat weightFormat3, QuantMode quantMode>
+          DataFormat weightFormat3, QuantMode quantMode, bool DirectOutput>
 __aicore__ inline void
-MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, quantMode>::ProcessCube()
+MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, quantMode, DirectOutput>::ProcessCube()
 {
 #ifdef __DAV_C220_CUBE__
     mm_w8a8_aic_1.Process();
@@ -2949,9 +2999,9 @@ MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, q
 }
 
 template <typename InDtype, int8_t CACHE_MODE, DataFormat weightFormat1, DataFormat weightFormat2,
-          DataFormat weightFormat3, QuantMode quantMode>
+          DataFormat weightFormat3, QuantMode quantMode, bool DirectOutput>
 __aicore__ inline void
-MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, quantMode>::ProcessVector()
+MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, quantMode, DirectOutput>::ProcessVector()
 {
 #ifdef __DAV_C220_VEC__
     if (row_work_ != 0) {
@@ -3012,8 +3062,11 @@ MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, q
             buf.GetBuffer<BufferType::ASCEND_UB, InDtype>(mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2);
         AscendC::LocalTensor<InDtype> cos_tensor = buf.GetBuffer<BufferType::ASCEND_UB, InDtype>(
             mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2 + splitRmsNormSizeTwo_ * 2);
-        AscendC::LocalTensor<int32_t> slotMapping_tensor = buf.GetBuffer<BufferType::ASCEND_UB, int32_t>(
-            mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2 + splitRmsNormSizeTwo_ * 4);
+        AscendC::LocalTensor<int32_t> slotMapping_tensor;
+        if constexpr (!DirectOutput) {
+            slotMapping_tensor = buf.GetBuffer<BufferType::ASCEND_UB, int32_t>(
+                mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2 + splitRmsNormSizeTwo_ * 4);
+        }
         int32_t rms3_ub_offset =
             mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2 + splitRmsNormSizeTwo_ * 4 + 4096 * 32;
         AscendC::LocalTensor<float> tmp32_tensor = buf.GetBuffer<BufferType::ASCEND_UB, float>(rms3_ub_offset);
@@ -3067,6 +3120,12 @@ MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, q
     if constexpr (CACHE_MODE == CACHE_MODE_INT8_NZCACHE) {
         WaitFlagDev(EINSUMQUANT);
         einSumQuant.Process();
+    }
+    if constexpr (DirectOutput) {
+        if (mlaParams.writebackCapacity != 0) {
+            // The kernel completion event must include mapped-CPU MTE3 stores.
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
     }
 #endif
 }

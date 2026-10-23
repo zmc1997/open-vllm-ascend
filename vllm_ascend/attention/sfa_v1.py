@@ -1,4 +1,5 @@
 import enum
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -923,6 +924,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.vllm_config.kv_transfer_config is not None
             and self.vllm_config.kv_transfer_config.is_kv_consumer
             and self.vllm_config.scheduler_config.max_num_batched_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
+            # Offload retains the native path for prefill/mixed batches and
+            # inputs outside the supported MLAPO token range.
+            and not get_ascend_config().sparse_kv_offload_config.enabled
         ):
             self.fused_qkv_a_proj.weight = None
             self.fused_qkv_a_proj.deq_scale = None
@@ -1389,6 +1393,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             kv_cache_out1=k_pe,
             inner_out=q_c,
         )
+        if os.environ.get("VLLM_PATCH_TRACE") == "1" and not getattr(self, "_patch_mlapo_traced", False):
+            logger.info(
+                "MLAPO preprocess submitted: layer=%s tp_rank=%d tokens=%d",
+                self.layer_name or getattr(self, "_current_layer_name", None),
+                self.tp_rank,
+                num_input_tokens,
+            )
+            self._patch_mlapo_traced = True
         return hidden_states, ql_nope, q_pe, q_c
 
     def indexer_select_pre_process(
@@ -1438,7 +1450,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             k_li_scale = None
 
-        return k_li, k_li_scale
+        return k_li, k_li_scale, kw
 
     def indexer_select_post_process(
         self,
@@ -1450,6 +1462,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        kw: torch.Tensor,
     ):
         if not self.has_indexer:
             raise RuntimeError(
@@ -1459,7 +1472,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert self.wk_weights_proj is not None
         assert self.wq_b is not None
 
-        kw, _ = self.wk_weights_proj(x)
         weights = kw[:, self.head_dim :]
         if isinstance(q_c, tuple):
             q_c_tensor, q_c_scale = q_c
@@ -1882,7 +1894,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"got token_x={hidden_states.shape[0]} and cache_index={slot_mapping.numel()}."
                 )
             if self.has_indexer:
-                k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+                k_li, k_li_scale, indexer_kw = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
             else:
                 k_li, k_li_scale = None, None
             wait_for_kv_layer_from_connector(layer_name)
@@ -1907,6 +1919,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
+            if os.environ.get("VLLM_PATCH_TRACE") == "1" and not getattr(self, "_patch_native_traced", False):
+                logger.info(
+                    "SFA Native preprocessing selected: layer=%s tp_rank=%d tokens=%d fused_cpu_writeback=False",
+                    layer_name,
+                    self.tp_rank,
+                    num_input_tokens,
+                )
+                self._patch_native_traced = True
             if self.enable_sp and not self.enable_dsa_cp:
                 hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     hidden_states.contiguous(), need_gather_q_kv
@@ -1920,7 +1940,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_c = self.q_a_layernorm(q_c)
 
             if self.has_indexer:
-                k_li, k_li_scale = self.indexer_select_pre_process(
+                k_li, k_li_scale, indexer_kw = self.indexer_select_pre_process(
                     x=hidden_states,
                     cos=cos,
                     sin=sin,
@@ -2048,6 +2068,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sin=sin,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+                kw=indexer_kw,
             )
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)

@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <torch/torch.h>
 #include <pthread.h>
+#include <pybind11/stl.h>
 
 #if defined(__GNUC__) || defined(__clang__)
   #define HOT_FUNCTION __attribute__((hot))
@@ -663,7 +664,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lru_resident_compact_with_plan_stable_rows", &lru_resident_compact_with_plan_stable_rows,
         "CPU LRU resident compact with encoded plan and stable physical rows");
   m.def("enqueue_lru_resident_compact_with_plan_stable_rows", &enqueue_lru_resident_compact_with_plan_stable_rows,
-        "Enqueue stable-row external LRU planning on the current NPU stream");
+        "Enqueue stable-row external LRU planning on the current NPU stream",
+        py::arg("req_ids_ptr"), py::arg("last_req_ids_ptr"), py::arg("topk_indices_ptr"),
+        py::arg("stable_prefix_lens_ptr"), py::arg("slot_to_token_ptr"), py::arg("lru_slots_ptr"),
+        py::arg("current_slots_ptr"), py::arg("miss_count_ptr"), py::arg("miss_tokens_ptr"),
+        py::arg("miss_slots_ptr"), py::arg("token_mark_workspace_ptr"), py::arg("token_pos_workspace_ptr"),
+        py::arg("slot_workspace_ptr"), py::arg("miss_position_workspace_ptr"), py::arg("epochs_ptr"),
+        py::arg("physical_row_workspace_ptr"), py::arg("physical_row_capacity"), py::arg("encoded_plan_ptr"),
+        py::arg("encoded_plan_stride"), py::arg("num_reqs"), py::arg("topk"), py::arg("capacity"),
+        py::arg("max_token"), py::arg("workspace_threads"), py::arg("requested_threads"),
+        py::arg("visible_seq_lens_ptr"));
   m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
         "Compute sparse H2D metadata for compact LRU resident miss loads");
   m.def(
