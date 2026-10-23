@@ -232,8 +232,6 @@ def build_layerwise_reuse_layout(
     for physical_layer in physical_layers:
         if physical_layer in independent_layer_set:
             continue
-        # TODO(lf): Plan shared buffers independently for every cache spec.
-        # Slots are grouped by main spec. Indexer specs are validated separately.
         signature = layer_cache_specs[physical_layer].main.spec
         for bucket_signature, bucket_layers in signature_buckets:
             if signature == bucket_signature:
@@ -241,6 +239,32 @@ def build_layerwise_reuse_layout(
                 break
         else:
             signature_buckets.append((signature, [physical_layer]))
+
+    # Preserve main-cache sharing when indexers are absent or uniform. Split
+    # only mixed indexer formats, such as C8 and unquantized SFA layers.
+    compatible_buckets: list[tuple[KVCacheSpec, list[int]]] = []
+    for main_spec, bucket_layers in signature_buckets:
+        indexer_buckets: list[tuple[KVCacheSpec, list[int]]] = []
+        no_indexer_layers: list[int] = []
+        for layer in bucket_layers:
+            indexer = layer_cache_specs[layer].indexer
+            if indexer is None:
+                no_indexer_layers.append(layer)
+                continue
+            for indexer_spec, layers in indexer_buckets:
+                if indexer.spec == indexer_spec:
+                    layers.append(layer)
+                    break
+            else:
+                indexer_buckets.append((indexer.spec, [layer]))
+        if len(indexer_buckets) <= 1:
+            compatible_buckets.append((main_spec, bucket_layers))
+            continue
+        indexer_buckets[0][1].extend(no_indexer_layers)
+        for _, layers in indexer_buckets:
+            layers.sort()
+            compatible_buckets.append((main_spec, layers))
+    signature_buckets = compatible_buckets
 
     buffer_slots: list[tuple[int, ...]] = [(layer,) for layer in independent_layers]
     prefetch_layer_map: dict[int, int] = {}
@@ -325,7 +349,13 @@ def apply_layerwise_kv_cache_plan(
         cache_tensors = [tensors_by_name[layer_name] for layer_name in shared_by]
         tensor_sizes = {tensor.size for tensor in cache_tensors}
         if len(tensor_sizes) != 1:
-            raise ValueError("Layers sharing layerwise KV buffers must have equal tensor sizes for every cache spec.")
+            raise ValueError(
+                "Layerwise KV tensor size mismatch: "
+                + ", ".join(
+                    f"{spec.layer_name}={tensor.size}"
+                    for spec, tensor in zip(named_specs, cache_tensors)
+                )
+            )
         reference_spec = layer_specs[shared_by[0]]
         if any(layer_specs[layer_name] != reference_spec for layer_name in shared_by[1:]):
             raise ValueError(
