@@ -55,11 +55,14 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
 from vllm.model_executor.models.utils import extract_layer_index
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tp_group,
+    get_oproj_native_communicator,
     get_otp_group,
+    get_otp_total_group,
 )
 from vllm_ascend.utils import (
     enable_dsa_cp,
@@ -245,35 +248,123 @@ class OProjRowParallelOp(CustomRowParallelOp):
     def comm_group(self):
         return get_otp_group()
 
+    @property
+    def tp_rank(self):
+        # Attention owns a contiguous K/outerTP slice. Split that slice over
+        # the DP exchange group, preserving the checkpoint's K ordering.
+        return get_tp_group().rank_in_group * self.comm_group.world_size + self.comm_group.rank_in_group
+
+    @property
+    def tp_size(self):
+        return get_tp_group().world_size * self.comm_group.world_size
+
+    def prepare_mmrs(self):
+        if self.quant_pack is not None:
+            from vllm_ascend.ops.triton.oproj_quant_pack import prepare_parameters
+
+            # Weight postprocessing has already stored the BF16 reciprocal.
+            # Keep the widened pair alive across forward calls and graph replay.
+            self.quant_pack_parameters = prepare_parameters(
+                self.layer.aclnn_input_scale_reciprocal[:1], self.layer.aclnn_input_offset[:1]
+            )
+        if self.communication != "matmul_reduce_scatter":
+            return
+        # A3's quantized MMRS does not support nonzero bias. This explicit
+        # experiment adds the correction after BF16 RS, changing rounding.
+        # It must pass numerical and model-accuracy gates before deployment.
+        self.hcom_name = self.comm_group.device_group._get_backend(torch.device("npu")).get_hccl_comm_name(
+            self.comm_group.rank_in_group
+        )
+        self.mmrs_bias = (self.layer.quant_bias * self.layer.deq_scale).to(self.layer.params_dtype)
+
+    def matmul_reduce_scatter(self, x):
+        if x.dtype != torch.int8:
+            x = torch.ops.vllm.quantize(
+                x,
+                self.layer.aclnn_input_scale,
+                self.layer.aclnn_input_scale_reciprocal,
+                self.layer.aclnn_input_offset,
+            )
+        output = DeviceOperator.npu_mm_reduce_scatter_base(
+            x,
+            self.layer.weight,
+            self.hcom_name,
+            self.comm_group.world_size,
+            reduce_op="sum",
+            bias=None,
+            x2_scale=self.layer.deq_scale,
+            output_dtype=self.layer.params_dtype,
+            comm_mode="aiv",
+        )
+        # After RS every DP rank owns different rows: all ranks with outer
+        # TP rank 0 must add the full correction once, before the TP all-reduce.
+        if get_tp_group().rank_in_group == 0:
+            output.add_(self.mmrs_bias)
+        return output
+
     def apply_impl(
         self,
         input_: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        input_parallel = self.get_input_parallel(input_)
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            # The exchange below splits the DP axis. First select the outer
+            # TP slice, rather than applying the combined weight rank twice.
+            input_parallel = split_tensor_along_last_dim(input_, get_tp_group().world_size)[
+                get_tp_group().rank_in_group
+            ].contiguous()
 
         # Prepare tensors for all-to-all communication
         local_batch_size = input_parallel.size(0)
         chunk_size = self.input_size_per_partition
-        total_batch_size = local_batch_size * self.tp_size
+        exchange_size = self.comm_group.world_size
+        total_batch_size = local_batch_size * exchange_size
 
         # Reshape tensor for efficient cross-device transfer:
-        # [batch, dim] -> [tp_size, batch, chunk] -> flattened
-        send_buf = input_parallel.reshape(-1, self.tp_size, chunk_size).transpose(0, 1).contiguous().view(-1)
+        # [batch, K/outerTP] -> [extraDP, batch, K/totalTP] -> flattened
+        if self.quant_pack is not None:
+            # Quantize once directly into the DP-major send layout. The
+            # receiver's static W8A8 method accepts INT8 and skips quantization.
+            send_buf = self.quant_pack(
+                input_parallel,
+                *self.quant_pack_parameters,
+                exchange_size,
+                block_size=self.quant_pack_block_size,
+            ).view(-1)
+        else:
+            send_buf = (
+                input_parallel.reshape(local_batch_size, exchange_size, chunk_size).transpose(0, 1).contiguous().view(-1)
+            )
 
         # Create receive buffer
-        recv_buf = torch.empty(total_batch_size * chunk_size, dtype=input_parallel.dtype, device=input_parallel.device)
+        recv_buf = torch.empty(total_batch_size * chunk_size, dtype=send_buf.dtype, device=input_parallel.device)
 
         # Perform all-to-all communication
-        dist.all_to_all_single(recv_buf, send_buf, group=self.comm_group.device_group)
+        if self.native_communicator is not None:
+            self.native_communicator.all_to_all(send_buf, recv_buf)
+        else:
+            dist.all_to_all_single(recv_buf, send_buf, group=self.comm_group.device_group)
         input_parallel = recv_buf.view(total_batch_size, chunk_size)
 
-        # Only fuse bias add for rank 0 to avoid duplicate bias addition in TP>1
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
-
-        # otp-specific: Combine partial results across devices
-        output = self.comm_group.reduce_scatter(output_parallel, dim=0)
+        if self.communication == "matmul_reduce_scatter":
+            output = self.matmul_reduce_scatter(input_parallel)
+        else:
+            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+            assert self.quant_method is not None
+            output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
+            if self.communication == "all_reduce":
+                # All ranks have DP-major rows after A2A. A single TP*DP
+                # reduction replaces DP RS + TP AR; select this DP's rows.
+                if self.native_communicator is not None:
+                    output_parallel = self.native_communicator.all_reduce(output_parallel)
+                else:
+                    output_parallel = get_otp_total_group().all_reduce(output_parallel)
+                output = output_parallel.narrow(0, self.comm_group.rank_in_group * local_batch_size, local_batch_size)
+            else:
+                output = self.comm_group.reduce_scatter(output_parallel, dim=0)
+        if self.communication != "all_reduce" and get_tp_group().world_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
         output = output.view(input_.shape[0], self.layer.output_size)
 
         # Handle bias return based on configuration
@@ -282,8 +373,29 @@ class OProjRowParallelOp(CustomRowParallelOp):
 
     def update_attrs(self):
         super().update_attrs()
-        self.input_is_parallel = self.layer.input_is_parallel
-        self.input_size_per_partition = self.layer.input_size_per_partition
+        config = get_ascend_config().finegrained_tp_config
+        self.communication = config.oproj_communication
+        self.native_communicator = get_oproj_native_communicator() if config.oproj_native_communication else None
+        self.quant_pack = None
+        if config.oproj_quant_pack:
+            from vllm_ascend.ops.triton.oproj_quant_pack import quantize_pack
+
+            self.quant_pack = quantize_pack
+            self.quant_pack_block_size = config.oproj_quant_pack_block_size
+        if not self.reduce_results:
+            raise ValueError("Fine-grained o_proj TP requires reduce_results=True")
+        if get_tp_group().world_size > 1:
+            from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+            from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
+
+            if not (
+                isinstance(self.quant_method, AscendLinearMethod)
+                and isinstance(self.quant_method.quant_method, AscendW8A8LinearMethod)
+                and getattr(self.layer, "ascend_quant_method", "") != "compressed-tensors"
+                and self.layer.params_dtype == torch.bfloat16
+                and self.bias is None
+            ):
+                raise ValueError("Independent o_proj TP with outer TP > 1 requires bias-free static W8A8 BF16")
 
 
 class SequenceColumnParallelOp(CustomColumnParallelOp):
@@ -494,6 +606,21 @@ def _get_column_parallel_op(
     return None
 
 
+def _oproj_tp_enabled_for_layer(prefix: str) -> bool:
+    if not oproj_tp_enable():
+        return False
+    config = get_ascend_config().finegrained_tp_config
+    if not config.oproj_skip_mtp:
+        return True
+    # The config validates the GLM/DeepSeekMTP model roles. Resolve the actual
+    # checkpoint layer index before AscendRowParallelLinear creates weights.
+    start, stop = config.oproj_mtp_layer_range
+    layer_index = extract_layer_index(prefix)
+    if not 0 <= layer_index < stop:
+        raise ValueError(f"Unexpected o_proj layer index with oproj_skip_mtp enabled: {prefix}")
+    return layer_index < start
+
+
 def _get_row_parallel_op(
     prefix, layer
 ) -> MLPRowParallelOp | OProjRowParallelOp | DSV4OProjRowParallelOp | SequenceRowParallelOp | None:
@@ -501,7 +628,7 @@ def _get_row_parallel_op(
         return DSV4OProjRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
         return MLPRowParallelOp(layer)
-    if "o_proj" in prefix and oproj_tp_enable():
+    if "o_proj" in prefix and _oproj_tp_enabled_for_layer(prefix):
         return OProjRowParallelOp(layer)
     if enable_sp() and not _should_skip_sp_for_multimodal_encoder(prefix):
         # "share_expert" added for Step3p5

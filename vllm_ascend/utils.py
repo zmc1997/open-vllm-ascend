@@ -1164,7 +1164,7 @@ def get_potential_max_tokens() -> int:
 def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_model: bool = False) -> bool:
     """Decide whether to skip the all-reduce across the DP group.
 
-    LMHead TP always requires synchronization for uniform LMHead input shapes.
+    LMHead and o_proj TP require synchronization for uniform collective input shapes.
     Otherwise, skipping is applicable for all dense models and for moe models only on ranks
     that act as KV consumers. We skip the DP all-reduce when either:
     - Both the prefill and decode communication methods are MC2 (or FUSED_MC2), or
@@ -1181,7 +1181,7 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
     computed once in init, and select_moe_comm_method is just config lookups, so
     this is cheap and avoids id-reuse / stale-cache / init-ordering hazards.
     """
-    if lmhead_tp_enable():
+    if lmhead_tp_enable() or oproj_tp_enable():
         return False
 
     ascend_config = get_ascend_config()

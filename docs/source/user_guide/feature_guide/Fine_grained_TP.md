@@ -51,6 +51,56 @@ The Fine-Grained TP size for any component must:
 
 > ⚠️ Violating these constraints will result in runtime errors or undefined behavior.
 
+### Experimental GLM o_proj with outer TP
+
+For `glm_moe_dsa` static W8A8/BF16 decode, o_proj can additionally split each
+outer TP weight shard across adjacent DP replicas. Here
+`oproj_tensor_parallel_size` means the **total** number of weight shards, so
+the extra DP group size is `oproj_tensor_parallel_size / tensor_parallel_size`.
+The total must be a larger multiple of outer TP, and the extra DP group size
+must divide DP. For example, DP16/TP2 with o_proj TP4 uses DP subgroups of two.
+LM-head and other fine-grained settings retain their existing meanings.
+
+This experimental path requires a KV consumer, graph mode, recompute scheduler,
+PP=PCP=DCP=1, and no DSA-CP or FlashComm1/SP. The main model and eager MTP use
+the same o_proj groups; idle DP replicas must join every exchange. Changing
+outer TP alone does not enable the feature.
+
+Merge the following into the existing `additional_config`, preserving its
+other fields:
+
+```json
+{
+  "finegrained_tp_config": {
+    "lmhead_tensor_parallel_size": 16,
+    "oproj_tensor_parallel_size": 4,
+    "oproj_communication": "all_reduce"
+  }
+}
+```
+
+| Communication | Operation after DP all-to-all | Status |
+| --- | --- | --- |
+| `reduce_scatter` (default) | Quantized MM, DP RS, outer TP AR | Reference implementation |
+| `all_reduce` | Quantized MM, combined TP×DP AR, select local DP rows | Removes one collective stage |
+| `matmul_reduce_scatter` | Quantized MM+DP RS, post-RS compensation, outer TP AR | Experimental, outer TP2 and total TP4 only |
+
+The MMRS candidate uses AIV, `bias=None`, and adds BF16 compensation on every
+DP rank with outer TP rank zero. This changes rounding compared with adding
+int32 bias inside QuantMM. Numerical and full model accuracy gates are required
+before use; CPU routing tests do not validate the device implementation.
+None of these paths has an established end-to-end speedup in this patch.
+
+For outer TP2 and total o_proj TP4, `oproj_quant_pack=true` optionally fuses
+static W8A8 quantization and the DP send-layout conversion. The default is
+`false`. The sender produces contiguous INT8 `[2, N, K/2]`, AllToAll transfers
+INT8, and the receiver skips quantization. The kernel uses the stored BF16
+reciprocal and offset with FP32 separate multiply/add, round-to-nearest-even
+and int8 saturation; quantized matmul compensation and reduction are unchanged.
+This option does not select the reduction: explicitly choose `all_reduce`
+when comparing the AR4 candidate. Numerical equivalence and complete-chain
+performance must be checked on the target image before enabling model tests.
+
 ---
 
 ## How to Use Fine-grained TP

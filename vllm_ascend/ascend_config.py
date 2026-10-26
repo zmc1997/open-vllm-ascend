@@ -112,6 +112,12 @@ class AscendConfig:
             "VLLM_ASCEND_ENABLE_FLASHCOMM1",
             ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM1,
         )
+        if (
+            self.finegrained_tp_config.oproj_tensor_parallel_size > 0
+            and vllm_config.parallel_config.tensor_parallel_size > 1
+            and (self.enable_flashcomm1 or vllm_config.compilation_config.pass_config.enable_sp)
+        ):
+            raise AssertionError("Independent o_proj TP with outer TP > 1 does not support FlashComm1/SP")
         if self.scheduler_config.profiling_chunk_config.enabled and self.scheduler_config.enable_balance_scheduling:
             raise ValueError(
                 "profiling_chunk_config and balance scheduling (enable_balance_scheduling) "
@@ -528,6 +534,52 @@ class FinegrainedTPConfig:
 
     def __init__(self, finegrained_tp_config: dict, vllm_config):
         self.oproj_tensor_parallel_size = finegrained_tp_config.get("oproj_tensor_parallel_size", 0)
+        self.oproj_communication = finegrained_tp_config.get("oproj_communication", "reduce_scatter")
+        self.oproj_quant_pack = finegrained_tp_config.get("oproj_quant_pack", False)
+        if not isinstance(self.oproj_quant_pack, bool):
+            raise ValueError("oproj_quant_pack must be a boolean")
+        block_size = finegrained_tp_config.get("oproj_quant_pack_block_size", 1024)
+        if type(block_size) is not int or not 32 <= block_size <= 4096 or block_size & (block_size - 1):
+            raise ValueError("oproj_quant_pack_block_size must be an integer power of two from 32 to 4096")
+        self.oproj_quant_pack_block_size = block_size
+        self.oproj_skip_mtp = finegrained_tp_config.get("oproj_skip_mtp", False)
+        if not isinstance(self.oproj_skip_mtp, bool):
+            raise ValueError("oproj_skip_mtp must be a boolean")
+        self.oproj_native_communication = finegrained_tp_config.get("oproj_native_communication", False)
+        if not isinstance(self.oproj_native_communication, bool):
+            raise ValueError("oproj_native_communication must be a boolean")
+        if self.oproj_native_communication and (
+            self.oproj_communication != "all_reduce" or not self.oproj_quant_pack or not self.oproj_skip_mtp
+        ):
+            raise ValueError("Native o_proj communication requires all_reduce, quant_pack and skip_mtp")
+        self.oproj_mtp_layer_range = None
+        if self.oproj_communication not in ("reduce_scatter", "all_reduce", "matmul_reduce_scatter"):
+            raise ValueError("Unknown oproj_communication")
+        parallel = vllm_config.parallel_config
+        outer_tp = parallel.tensor_parallel_size
+        # o_proj specifies total weight shards; the exchange group spans only
+        # the extra DP dimension. Other fine-grained TP settings retain their semantics.
+        self.oproj_dp_size = self.oproj_tensor_parallel_size
+        if self.oproj_quant_pack and (outer_tp, self.oproj_tensor_parallel_size) != (2, 4):
+            raise ValueError("Fused o_proj quant-pack currently requires outer TP2 and total o_proj TP4")
+        if self.oproj_skip_mtp:
+            spec = vllm_config.speculative_config
+            target = vllm_config.model_config.hf_text_config
+            draft = getattr(getattr(spec, "draft_model_config", None), "hf_config", None)
+            if (
+                (outer_tp, self.oproj_tensor_parallel_size) != (2, 4)
+                or getattr(target, "model_type", None) != "glm_moe_dsa"
+                or getattr(spec, "method", None) != "mtp"
+                or getattr(draft, "model_type", None) != "deepseek_mtp"
+            ):
+                raise ValueError("oproj_skip_mtp requires GLM MTP with outer TP2 and total o_proj TP4")
+            start = getattr(target, "num_hidden_layers", None)
+            count = getattr(draft, "num_nextn_predict_layers", None)
+            if not isinstance(start, int) or start <= 0 or not isinstance(count, int) or count <= 0:
+                raise ValueError("oproj_skip_mtp requires valid target and MTP layer counts")
+            # DeepSeekMultiTokenPredictor constructs layers in this checkpoint
+            # index range; its construction prefix does not contain mtp_block.
+            self.oproj_mtp_layer_range = (start, start + count)
         self.lmhead_tensor_parallel_size = finegrained_tp_config.get("lmhead_tensor_parallel_size", 0)
         self.embedding_tensor_parallel_size = finegrained_tp_config.get("embedding_tensor_parallel_size", 0)
         self.mlp_tensor_parallel_size = finegrained_tp_config.get("mlp_tensor_parallel_size", 0)
@@ -536,18 +588,26 @@ class FinegrainedTPConfig:
         enabled_configs = []
         if self.oproj_tensor_parallel_size > 0:
             enabled_configs.append(f"oproj_tensor_parallel_size={self.oproj_tensor_parallel_size}")
-            # wo_a/wo_b are sharded solely by the OTP group (which splits DP,
-            # orthogonal to the standard TP group), but _forward_o_proj reshapes
-            # the attention output with n_local_groups = n_groups // tp_size
-            # (standard TP). When tp_size > 1 the weight-shard and input-shard
-            # operate on different axes of the rank grid and no longer align,
-            # so oproj TP currently requires standard tp_size == 1.
-            if vllm_config.parallel_config.tensor_parallel_size > 1:
-                raise AssertionError(
-                    "oproj_tensor_parallel_size currently requires "
-                    "tensor_parallel_size == 1, got "
-                    f"{vllm_config.parallel_config.tensor_parallel_size}."
-                )
+            enabled_configs.append(f"oproj_communication={self.oproj_communication}")
+            if self.oproj_skip_mtp:
+                enabled_configs.append("oproj_skip_mtp=True")
+            if self.oproj_native_communication:
+                enabled_configs.append("oproj_native_communication=True")
+            if outer_tp > 1:
+                if getattr(vllm_config.model_config.hf_text_config, "model_type", None) != "glm_moe_dsa":
+                    raise AssertionError("Independent o_proj TP with outer TP > 1 currently supports glm_moe_dsa only")
+                if self.oproj_tensor_parallel_size <= outer_tp or self.oproj_tensor_parallel_size % outer_tp:
+                    raise AssertionError("oproj_tensor_parallel_size must be a larger multiple of outer TP")
+                self.oproj_dp_size = self.oproj_tensor_parallel_size // outer_tp
+                if any(
+                    getattr(parallel, name, 1) != 1
+                    for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
+                ) or (vllm_config.additional_config or {}).get("enable_dsa_cp", False):
+                    raise AssertionError("Independent o_proj TP requires PP=PCP=DCP=1 and enable_dsa_cp=false")
+            elif self.oproj_communication != "reduce_scatter":
+                raise AssertionError("Alternative o_proj communication modes require outer TP > 1")
+            if self.oproj_communication == "matmul_reduce_scatter" and (outer_tp, self.oproj_dp_size) != (2, 2):
+                raise AssertionError("Experimental o_proj MMRS currently requires outer TP2 and total o_proj TP4")
             # The static all_to_all / reduce_scatter exchange buffers used by
             # _forward_o_proj are sized for graph replay and require ACL graph
             # capture; dummy_run does not run the entire attention module in
@@ -575,7 +635,7 @@ class FinegrainedTPConfig:
         if self.mlp_tensor_parallel_size > 0:
             enabled_configs.append(f"mlp_tensor_parallel_size={self.mlp_tensor_parallel_size}")
         module_tp_sizes = [
-            self.oproj_tensor_parallel_size,
+            self.oproj_dp_size,
             self.lmhead_tensor_parallel_size,
             self.embedding_tensor_parallel_size,
             self.mlp_tensor_parallel_size,

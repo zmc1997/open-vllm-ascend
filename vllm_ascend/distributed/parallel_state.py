@@ -10,6 +10,8 @@ _MC2: GroupCoordinator | None = None
 # Module specific tensor parallel groups
 _MLP_TP: GroupCoordinator | None = None
 _OTP: GroupCoordinator | None = None
+_OTP_TOTAL: GroupCoordinator | None = None
+_OPROJ_NATIVE = None
 _LMTP: GroupCoordinator | None = None
 _EMBED_TP: GroupCoordinator | None = None
 
@@ -102,7 +104,12 @@ def init_ascend_model_parallel(
     def _create_or_get_group(group_size: int, group_name: str) -> GroupCoordinator:
         if group_size is None:
             return None
-        if group_size not in _group_cache:
+        # Native OTP owns its transport; another component must not alias
+        # its otherwise-unused HCCL process group and materialize it later.
+        cache_key = (
+            (group_size, group_name) if group_name == "otp" and otp_config.oproj_native_communication else group_size
+        )
+        if cache_key not in _group_cache:
             rank_grid = torch.arange(world_size).reshape(global_pp_size, global_dp_size, global_tp_size)
             num_chunks = global_dp_size // group_size
             group_ranks = []
@@ -113,25 +120,39 @@ def init_ascend_model_parallel(
                         group = stage_ranks[chunk * group_size : (chunk + 1) * group_size, tp_idx].tolist()
                         group_ranks.append(group)
             pg = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name=group_name)
-            _group_cache[group_size] = pg
+            _group_cache[cache_key] = pg
 
-        return _group_cache[group_size]
+        return _group_cache[cache_key]
 
-    otp_size = get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size
+    otp_config = get_ascend_config().finegrained_tp_config
+    otp_size = otp_config.oproj_dp_size
     lmhead_tp_size = get_ascend_config().finegrained_tp_config.lmhead_tensor_parallel_size
     embedding_tp_size = get_ascend_config().finegrained_tp_config.embedding_tensor_parallel_size
     mlp_tp_size = get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size
 
-    global _OTP, _LMTP, _EMBED_TP, _MLP_TP
+    global _OTP, _OTP_TOTAL, _OPROJ_NATIVE, _LMTP, _EMBED_TP, _MLP_TP
 
     if otp_size > 0:
         _OTP = _create_or_get_group(otp_size, "otp")
+        if otp_config.oproj_communication == "all_reduce":
+            # Own this group separately: it spans both DP and TP, unlike the
+            # fixed-TP groups in _group_cache. PP/CP are guarded by the config.
+            ranks = all_ranks.reshape(-1, otp_size * global_tp_size).tolist()
+            _OTP_TOTAL = init_model_parallel_group(
+                ranks, get_world_group().local_rank, backend, group_name="otp_total"
+            )
     if lmhead_tp_size > 0:
         _LMTP = _create_or_get_group(lmhead_tp_size, "lmheadtp")
     if embedding_tp_size > 0:
         _EMBED_TP = _create_or_get_group(embedding_tp_size, "emtp")
     if mlp_tp_size > 0:
         _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
+    if otp_config.oproj_native_communication:
+        from vllm_ascend.distributed.oproj_communicator import OProjNativeCommunicator
+
+        # All layers share two native communicators. Construction includes
+        # collective warmup, so initialize on every rank before graph capture.
+        _OPROJ_NATIVE = OProjNativeCommunicator(_OTP, _OTP_TOTAL, torch.device("npu", torch.npu.current_device()))
 
 
 def model_parallel_initialized():
@@ -151,6 +172,17 @@ def get_mlp_tp_group() -> GroupCoordinator:
 def get_otp_group() -> GroupCoordinator:
     assert _OTP is not None, "output tensor parallel group is not initialized"
     return _OTP
+
+
+def get_otp_total_group() -> GroupCoordinator:
+    assert _OTP_TOTAL is not None, "combined output tensor parallel group is not initialized"
+    return _OTP_TOTAL
+
+
+def get_oproj_native_communicator():
+    if _OPROJ_NATIVE is None:
+        raise RuntimeError("Native o_proj communicator is not initialized")
+    return _OPROJ_NATIVE
 
 
 def get_lmhead_tp_group() -> GroupCoordinator:
@@ -174,6 +206,11 @@ def get_dynamic_eplb_group() -> GroupCoordinator:
 
 
 def destroy_ascend_model_parallel():
+    global _OPROJ_NATIVE
+    if _OPROJ_NATIVE is not None:
+        _OPROJ_NATIVE.close()
+        _OPROJ_NATIVE = None
+
     global _MC2
     if _MC2:
         _MC2.destroy()
@@ -198,6 +235,11 @@ def destroy_ascend_model_parallel():
     if _OTP:
         _OTP.destroy()
     _OTP = None
+
+    global _OTP_TOTAL
+    if _OTP_TOTAL:
+        _OTP_TOTAL.destroy()
+    _OTP_TOTAL = None
 
     global _P_TP
     if _P_TP:

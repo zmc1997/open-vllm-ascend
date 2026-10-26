@@ -68,6 +68,7 @@ from vllm_ascend.utils import (
     enable_sp,
     get_ascend_device_type,
     maybe_trans_nz,
+    oproj_tp_enable,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
@@ -1837,7 +1838,11 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
-            # Profiling run.
+            # Only layers whose weights span DP need idle peers to contribute.
+            # A TP2 MTP layer has no cross-DP o_proj dependency.
+            if oproj_tp_enable() and self.o_proj.tp_size > get_tensor_model_parallel_world_size():
+                dummy = hidden_states.new_zeros((hidden_states.shape[0], self.local_num_heads * self.v_head_dim))
+                self.o_proj(dummy)
             return output.fill_(0)
 
         composed_kv_cache = self._compose_sfa_kv_cache(kv_cache)
