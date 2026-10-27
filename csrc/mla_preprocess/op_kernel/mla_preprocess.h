@@ -96,6 +96,9 @@ constexpr uint32_t SYNC_MODE = 2;
 // TilingKey
 constexpr uint32_t KEY_FP16_CACHEMODE_0_QUANTMODE_0 = 0;
 constexpr uint32_t KEY_FP16_CACHEMODE_1_QUANTMODE_0 = 1;
+constexpr uint32_t KEY_FP16_CACHEMODE_0_QUANTMODE_0_INNER = 0 + 512;
+constexpr uint32_t KEY_FP16_CACHEMODE_1_QUANTMODE_0_INNER = 1 + 512;
+constexpr uint32_t KEY_DIRECT_OUTPUT = 1U << 10;
 constexpr uint32_t KEY_BF16_CACHEMODE_0_QUANTMODE_0 = 256;
 constexpr uint32_t KEY_BF16_CACHEMODE_1_QUANTMODE_0 = 257;
 constexpr uint32_t KEY_BF16_CACHEMODE_3_QUANTMODE_0 = 259;
