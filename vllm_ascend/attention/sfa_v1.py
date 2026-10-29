@@ -721,6 +721,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.W_UK_T.copy_(W_UK.permute(1, 2, 0).contiguous())
 
         self._init_vup_triton_bmm()
+        self._init_indexer_k_triton_cache()
 
         # TODO(zzzzwwjj): Currently, torch.ops._C_ascend.batch_matmul_transpose cannot support weight nz
         # self.W_UV = maybe_trans_nz(self.W_UV)
@@ -1187,6 +1188,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         ql_nope = torch.bmm(q_nope, self.W_UK_T)
         # Convert from (N, B, L) to (B, N, L)
         return ql_nope.transpose(0, 1), q_pe
+
+    def _init_indexer_k_triton_cache(self):
+        """Select the scatter implementation without model or batch restrictions."""
+        self._indexer_k_triton_cache = None
+        if not get_ascend_config().enable_indexer_k_triton_cache:
+            return
+        from vllm_ascend.ops.triton.indexer_cache import scatter_k_cache, scatter_scale_cache
+
+        self._indexer_k_triton_cache = (scatter_k_cache, scatter_scale_cache)
 
     def _init_vup_triton_bmm(self):
         """Select BMM once; its dimensions and strides come from each input."""
@@ -2022,6 +2032,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             use_li_c8_reshape_optim = self._use_li_c8_reshape_optim()
             dsa_k_cache_idx = self.kv_cache_indexer_k_idx
             dsa_k_scale_cache_idx = self.kv_cache_indexer_scale_idx
+            use_triton_indexer_cache = self._indexer_k_triton_cache is not None
 
             if use_li_c8_reshape_optim:
                 torch.ops._C_ascend.store_kv_block(
@@ -2031,6 +2042,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.group_key_idx,
                     attn_metadata.group_key_cache_idx,
                     attn_metadata.block_size,
+                )
+            elif use_triton_indexer_cache:
+                self._indexer_k_triton_cache[0](
+                    kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
+                    slot_mapping.view(-1, 1),
+                    k_li.view(-1, k_li.shape[-1]),
                 )
             else:
                 torch_npu.npu_scatter_nd_update_(
@@ -2049,6 +2066,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                             attn_metadata.group_key_idx,
                             attn_metadata.group_key_cache_idx,
                             attn_metadata.block_size,
+                        )
+                    elif use_triton_indexer_cache:
+                        self._indexer_k_triton_cache[1](
+                            kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
+                            slot_mapping.view(-1, 1),
+                            k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
                     else:
                         torch_npu.npu_scatter_nd_update_(

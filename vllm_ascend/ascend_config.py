@@ -184,6 +184,9 @@ class AscendConfig:
         self.enable_indexer_q_triton_quant = additional_config.get("enable_indexer_q_triton_quant", False)
         if not isinstance(self.enable_indexer_q_triton_quant, bool):
             raise ValueError("enable_indexer_q_triton_quant must be a boolean")
+        self.enable_indexer_k_triton_cache = additional_config.get("enable_indexer_k_triton_cache", False)
+        if not isinstance(self.enable_indexer_k_triton_cache, bool):
+            raise ValueError("enable_indexer_k_triton_cache must be a boolean")
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
 
         self.enable_fused_mc2 = self._get_config_value(
