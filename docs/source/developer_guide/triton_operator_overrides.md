@@ -103,3 +103,58 @@ TEST-065 measured BF16 `[6,2048]` at 1.500 us for this candidate,
 4.212 us for the preceding Triton implementation and 7.020 us for CANN,
 using the same inputs and parameter representation in one batch.
 The single-operator saving must not be presented as model latency improvement.
+
+## Indexer K Cache writes
+
+Set `enable_indexer_k_triton_cache` in `additional_config` to replace the
+original scatter updates for K data and scale. These remain two separate
+calls, sharing one implementation. The existing `store_kv_block` route keeps
+its priority; original notifications remain after the writes.
+
+Dimensions, source/cache strides and element sizes come from the tensors.
+Writes preserve raw bits and the original cache alias. For repeated valid
+slots, the last input update wins; `-1` padding slots are skipped. Behavior
+for arbitrary invalid indices has not been established against CANN and
+must not be claimed as fully equivalent. Disjoint cache-address ranges belong
+to different owners; each owner scans the input in order. This avoids sorting,
+workspace and a cross-core barrier. Nearby slots may serialize on one owner;
+this is a documented limitation, not a performance guarantee for every slot
+distribution.
+
+```bash
+python tests/ut/attention/test_indexer_k_triton_cache.py --source-root .
+python tests/ut/ops/test_indexer_cache.py --source-root .
+python tests/ut/ops/test_indexer_cache_npu.py --self-test
+```
+
+TEST-064 completed 328 same-layout CANN cases and 72 reference-only cases
+for CANN-rejected output layouts with the retained copy05 implementation;
+all recorded checks passed. TEST-065 also compared it with CANN and an experimental cyclic-owner variant in one
+62-case, 1,060-check batch. At the recorded production cache capacity, K writes
+measured 4.513 vs CANN 6.953 us, and scale writes 4.556 vs CANN 6.959 us.
+The cyclic-owner variant passed correctness but added almost no benefit for
+those inputs and regressed dispersed-slot cases by 6.359-8.481 us relative to
+copy05, so it is not included. Binary-matched physical IR for the recorded
+copy05 signatures confirms direct source-to-cache copies; this does not prove
+all possible compiler signatures or remove the owner-load limitation.
+
+## Same-batch operator comparisons
+
+After the strict gates pass, the full-call layout benchmark can compare
+each implementation with CANN and optionally a frozen previous source:
+
+```bash
+python tests/ut/ops/benchmark_operator_layouts.py \
+  --source-dir vllm_ascend/ops/triton --kind quant --kind bmm --kind cache \
+  --dtype bf16 --dtype fp16 --dtype fp32 --device 0 --output result.json
+```
+
+Run only on an idle, isolated NPU. The tool checks bytes, graph input
+freshness, input immutability and Cache aliases before timing. Event times
+include internal copies and are averaged over graph repetitions; they are
+not individual kernel durations or model ITL/TPOT. The shapes and slot
+distributions in this benchmark are fixtures, not production restrictions.
+
+These four overrides do not include the discarded LayerNorm, Q dynamic
+quantization, independent TP4 or replacement INT8 GEMM experiments. Model
+testing remains a separate step after reviewing the operator results.
