@@ -720,6 +720,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.W_UV.copy_(W_UV.transpose(0, 1).contiguous())
             self.W_UK_T.copy_(W_UK.permute(1, 2, 0).contiguous())
 
+        self._init_vup_triton_bmm()
+
         # TODO(zzzzwwjj): Currently, torch.ops._C_ascend.batch_matmul_transpose cannot support weight nz
         # self.W_UV = maybe_trans_nz(self.W_UV)
 
@@ -1186,7 +1188,20 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Convert from (N, B, L) to (B, N, L)
         return ql_nope.transpose(0, 1), q_pe
 
+    def _init_vup_triton_bmm(self):
+        """Select BMM once; its dimensions and strides come from each input."""
+        self._vup_triton_bmm = None
+        if not get_ascend_config().enable_vup_triton_bmm:
+            return
+        from vllm_ascend.ops.triton.vup_bmm import vup_bmm
+
+        self._vup_triton_bmm = vup_bmm
+
     def _v_up_proj(self, x):
+        if self._vup_triton_bmm is not None:
+            heads, rank, width = self.W_UV.shape
+            x = x.view(-1, heads, rank)
+            return self._vup_triton_bmm(x, self.W_UV).reshape(-1, heads * width)
         if hasattr(torch_npu, "npu_transpose_batchmatmul"):
             # aclnn TransposeBatchMatMul with perm_x1=(1,0,2) (internal
             # transpose) requires N*L < 65536 on older CANN binaries.
