@@ -86,3 +86,20 @@ then passed all 24 combined-chain cases with the new quantization schedule;
 BF16 main/MTP-shaped chains measured 9.477/9.447 us vs CANN 18.236/18.133 us.
 These inputs are synthetic with captured parameter values, not captured model
 activations; the chain excludes GEMM and reduction.
+
+## Indexer Q static quantization
+
+Set `enable_indexer_q_triton_quant` in `additional_config` to select the
+same static quantization implementation for `.indexer.wq_b` linear layers.
+The switch is independent of the o_proj and BMM switches. This changes the
+static quantization before the Q projection, not Q dynamic quantization.
+There is no duplicate kernel and no special batch-size or width restriction.
+
+```bash
+python tests/ut/quantization/test_indexer_q_triton_quant.py --source-root .
+```
+
+TEST-065 measured BF16 `[6,2048]` at 1.500 us for this candidate,
+4.212 us for the preceding Triton implementation and 7.020 us for CANN,
+using the same inputs and parameter representation in one batch.
+The single-operator saving must not be presented as model latency improvement.

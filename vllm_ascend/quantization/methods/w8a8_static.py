@@ -131,7 +131,8 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
         layer._static_triton_quant = None
         config = get_ascend_config()
         is_oproj = config.enable_oproj_triton_quant is True and layer.prefix.endswith(".o_proj")
-        if is_oproj:
+        is_indexer_q = config.enable_indexer_q_triton_quant is True and layer.prefix.endswith(".indexer.wq_b")
+        if is_oproj or is_indexer_q:
             from vllm_ascend.ops.triton.static_quantize import quantize
 
             # Reuse the original CANN parameter tensors, including their stored
