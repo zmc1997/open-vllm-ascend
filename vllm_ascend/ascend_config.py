@@ -178,6 +178,9 @@ class AscendConfig:
         self.enable_oproj_triton_quant = additional_config.get("enable_oproj_triton_quant", False)
         if not isinstance(self.enable_oproj_triton_quant, bool):
             raise ValueError("enable_oproj_triton_quant must be a boolean")
+        self.enable_vup_triton_bmm = additional_config.get("enable_vup_triton_bmm", False)
+        if not isinstance(self.enable_vup_triton_bmm, bool):
+            raise ValueError("enable_vup_triton_bmm must be a boolean")
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
 
         self.enable_fused_mc2 = self._get_config_value(
