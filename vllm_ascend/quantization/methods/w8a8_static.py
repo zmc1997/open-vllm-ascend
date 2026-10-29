@@ -20,6 +20,7 @@ from typing import Any
 import torch
 import torch_npu
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import (
     COMPRESSED_TENSORS_METHOD,
     maybe_trans_nz,
@@ -78,13 +79,16 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
         if x.dtype != torch.int8:
-            # quant
-            x = torch.ops.vllm.quantize(
-                x,
-                layer.aclnn_input_scale,
-                layer.aclnn_input_scale_reciprocal,
-                layer.aclnn_input_offset,
-            )
+            triton_quant = getattr(layer, "_static_triton_quant", None)
+            if triton_quant is not None:
+                x = triton_quant(x, layer._static_triton_reciprocal, layer._static_triton_offset)
+            else:
+                x = torch.ops.vllm.quantize(
+                    x,
+                    layer.aclnn_input_scale,
+                    layer.aclnn_input_scale_reciprocal,
+                    layer.aclnn_input_offset,
+                )
 
         quant_bias = layer.quant_bias if tp_rank == 0 else None
 
@@ -123,3 +127,15 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
         if ascend_quant_method == COMPRESSED_TENSORS_METHOD:
             deq_scale = layer.input_scale.data * layer.weight_scale.data
             layer.deq_scale = torch.nn.Parameter(deq_scale, requires_grad=False)
+
+        layer._static_triton_quant = None
+        config = get_ascend_config()
+        is_oproj = config.enable_oproj_triton_quant is True and layer.prefix.endswith(".o_proj")
+        if is_oproj:
+            from vllm_ascend.ops.triton.static_quantize import quantize
+
+            # Reuse the original CANN parameter tensors, including their stored
+            # dtype and graph-visible updates; do not recompute 1/scale.
+            layer._static_triton_reciprocal = layer.aclnn_input_scale_reciprocal
+            layer._static_triton_offset = layer.aclnn_input_offset
+            layer._static_triton_quant = quantize
