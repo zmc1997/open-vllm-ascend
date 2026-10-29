@@ -19,6 +19,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionBackend
@@ -30,7 +31,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.utils import CpuGpuBuffer
 
-from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
+from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config, validate_additional_config_bool
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
@@ -549,8 +550,57 @@ class SparseKVOffloadManager:
         config.scene = offload.Scene.SHARED
         store_port = OFFLOAD_STORE_PORT_BASE + parallel_config.data_parallel_index
         config.store_url = f"tcp://127.0.0.1:{store_port}"
+        self._configure_unrestricted_cpu_pool(config)
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
+
+    def _configure_unrestricted_cpu_pool(self, config) -> None:
+        transfer = self.vllm_config.kv_transfer_config
+        extra = transfer.kv_connector_extra_config if transfer is not None else {}
+        # Agree before branching: enabled ranks later enter a CPU collective,
+        # while disabled ranks must not proceed into a different MF collective.
+        requested_modes = [None] * self.tp_size
+        torch.distributed.all_gather_object(
+            requested_modes,
+            extra.get("memfabric_unrestricted_cpu_pool", False),
+            group=self.tp_group.cpu_group,
+        )
+        enabled_modes = [
+            validate_additional_config_bool(value, "kv_connector_extra_config.memfabric_unrestricted_cpu_pool")
+            for value in requested_modes
+        ]
+        if any(enabled_modes) != all(enabled_modes):
+            raise ValueError("memfabric_unrestricted_cpu_pool must agree on every TP rank")
+        enabled = enabled_modes[0]
+        if not enabled:
+            return
+        # This pool must never become a remote import target. The built-in
+        # MemFabric SDMA consumer pulls P's registered HBM into local CPU memory.
+        protocol = (extra.get("memfabric_transfer_protocol") or "sdma").strip().lower()
+        if (
+            get_ascend_device_type() != AscendDeviceType.A3
+            or transfer.kv_connector != "SfaRemoteD2HConnector"
+            or transfer.kv_connector_module_path is not None
+            or transfer.kv_role != "kv_consumer"
+            or extra.get("transfer_backend", "memfabric") != "memfabric"
+            or protocol != "sdma"
+            or not self.use_fused_overlap
+        ):
+            raise ValueError(
+                "memfabric_unrestricted_cpu_pool requires A3, built-in SfaRemoteD2HConnector "
+                "kv_consumer, MemFabric SDMA pull and fused-overlap offload"
+            )
+        flag = getattr(offload, "OFFLOAD_FLAG_SHARED_LOCAL_UNRESTRICTED", None)
+        if flag is None:
+            raise RuntimeError("MemFabric lacks OFFLOAD_FLAG_SHARED_LOCAL_UNRESTRICTED; install the matching build")
+        if not all(in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)):
+            raise ValueError("memfabric_unrestricted_cpu_pool requires every TP rank on the same host")
+        config.local_world_size = self.tp_size
+        config.flags |= flag
+        logger.info(
+            "MemFabric CPU pool uses single-host SHARED UNRESTRICTED allocation; TP size=%s, SDMA pull only",
+            self.tp_size,
+        )
 
     def _warmup_external_lru_planner_threads(self) -> int:
         if not (self.use_fused_overlap and self.tp_rank == 0):
