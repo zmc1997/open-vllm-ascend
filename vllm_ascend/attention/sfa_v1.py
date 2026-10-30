@@ -1609,7 +1609,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
-        return DeviceOperator.indexer_select_post_process(
+        topk_indices = DeviceOperator.indexer_select_post_process(
             self,
             q_li,
             q_li_scale,
@@ -1622,6 +1622,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.enable_sparse_li_c8,
             self.use_torch_npu_lightning_indexer,
         )
+        return topk_indices
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:

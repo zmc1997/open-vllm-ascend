@@ -215,6 +215,26 @@ order can expose prefetch or connector waits, so model benefit requires
 device measurements; the two overlap windows are not an ITL guarantee.
 Direct MLAPO and PROLOG_V3 retain their existing Indexer schedule.
 
+### Experimental GLM weight prefetch
+
+`weight_prefetch_config` in `--additional-config` enables the imported GLM
+Decode/MTP weight-prefetch paths. It defaults to `{"enabled": false}`.
+The byte limits are independent:
+
+| Option | Default bytes | Prefetch window |
+| --- | ---: | --- |
+| `wd_qkv_max_prefetch_bytes` | 16777216 | Previous layer's shared-expert computation |
+| `wu_q_max_prefetch_bytes` | 0 | Same window as `wd_qkv` |
+| `w_uk_t_max_prefetch_bytes` | 0 | Same window as `wd_qkv` |
+| `o_proj_max_prefetch_bytes` | 0 | o_proj input quantization |
+| `mtp_rot_max_prefetch_bytes` | 0 | Draft logits to the next draft's rotation |
+
+Set `enabled` to `true` and choose the byte limits to test. Direct plans
+require supported GLM Decode offload with shared-expert overlap; MTP rotation
+requires eager sequential single-layer GLM MTP. Binding does not change the
+MTP execution mode. Zero disables an individual window. Measure correctness,
+graph replay and performance on the deployment before enabling these paths.
+
 ## 4. Use Them Together
 
 The combined data flow is:

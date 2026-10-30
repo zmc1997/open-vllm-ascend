@@ -78,6 +78,11 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
+        # Bound o_proj plans start here, after V-up, to overlap only input
+        # quantization instead of competing with V-up's weight reads.
+        prefetch_plan = getattr(layer, "_o_proj_weight_prefetch", None)
+        if prefetch_plan is not None:
+            prefetch_plan.submit(x)
         if x.dtype != torch.int8:
             triton_quant = getattr(layer, "_static_triton_quant", None)
             if triton_quant is not None:
@@ -90,6 +95,10 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
                     layer.aclnn_input_offset,
                 )
 
+        # Wait after quantization, immediately before the weight consumer.
+        if prefetch_plan is not None:
+            prefetch_plan.wait()
+
         quant_bias = layer.quant_bias if tp_rank == 0 else None
 
         try:
@@ -99,13 +108,14 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
         if ascend_quant_method == COMPRESSED_TENSORS_METHOD:
             quant_bias = bias
 
-        return torch_npu.npu_quant_matmul(
+        output = torch_npu.npu_quant_matmul(
             x,
             layer.weight,
             layer.deq_scale,
             bias=quant_bias,
             output_dtype=layer.params_dtype,
         )
+        return output
 
     def process_weights_after_loading(self, layer):
         expanding_factor = layer.weight.data.shape[1]

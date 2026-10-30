@@ -377,6 +377,8 @@ class AscendConfig:
         )
         self._validate_sparse_c8_kv_offload_compatibility()
 
+        self.weight_prefetch_config = WeightPrefetchConfig(additional_config.get("weight_prefetch_config", {}))
+
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
             raise NotImplementedError(
@@ -532,6 +534,50 @@ class AscendConfig:
         if self.mc2_comm_alg == "fullmesh" and get_ascend_device_type() == AscendDeviceType.A3:
             return "fullmesh_v1"
         return self.mc2_comm_alg
+
+
+class WeightPrefetchConfig:
+    """Experimental target/MTP weight prefetch for GLM decode."""
+
+    def __init__(self, config: dict[str, Any]):
+        if not isinstance(config, dict):
+            raise TypeError("weight_prefetch_config must be a dict")
+        unknown = config.keys() - {
+            "enabled",
+            "max_prefetch_bytes",
+            "wd_qkv_max_prefetch_bytes",
+            "wu_q_max_prefetch_bytes",
+            "w_uk_t_max_prefetch_bytes",
+            "o_proj_max_prefetch_bytes",
+            "mtp_rot_max_prefetch_bytes",
+        }
+        if unknown:
+            raise ValueError(f"Unknown weight_prefetch_config options: {sorted(unknown)}")
+        self.enabled = config.get("enabled", False)
+        if "max_prefetch_bytes" in config and "wd_qkv_max_prefetch_bytes" in config:
+            raise ValueError("Specify only wd_qkv_max_prefetch_bytes, not both old and new names")
+        self.wd_qkv_max_prefetch_bytes = config.get(
+            "wd_qkv_max_prefetch_bytes", config.get("max_prefetch_bytes", 16 * 1024 * 1024)
+        )
+        self.max_prefetch_bytes = self.wd_qkv_max_prefetch_bytes
+        # Zero preserves the original wd_qkv-only path.
+        self.wu_q_max_prefetch_bytes = config.get("wu_q_max_prefetch_bytes", 0)
+        self.w_uk_t_max_prefetch_bytes = config.get("w_uk_t_max_prefetch_bytes", 0)
+        self.o_proj_max_prefetch_bytes = config.get("o_proj_max_prefetch_bytes", 0)
+        self.mtp_rot_max_prefetch_bytes = config.get("mtp_rot_max_prefetch_bytes", 0)
+        if not isinstance(self.enabled, bool):
+            raise TypeError("weight_prefetch_config.enabled must be a bool")
+        if type(self.wd_qkv_max_prefetch_bytes) is not int or self.wd_qkv_max_prefetch_bytes < 0:
+            raise ValueError("weight_prefetch_config.wd_qkv_max_prefetch_bytes must be a non-negative int")
+        if type(self.wu_q_max_prefetch_bytes) is not int or self.wu_q_max_prefetch_bytes < 0:
+            raise ValueError("weight_prefetch_config.wu_q_max_prefetch_bytes must be a non-negative int")
+        if type(self.w_uk_t_max_prefetch_bytes) is not int or self.w_uk_t_max_prefetch_bytes < 0:
+            raise ValueError("weight_prefetch_config.w_uk_t_max_prefetch_bytes must be a non-negative int")
+        if type(self.o_proj_max_prefetch_bytes) is not int or self.o_proj_max_prefetch_bytes < 0:
+            raise ValueError("weight_prefetch_config.o_proj_max_prefetch_bytes must be a non-negative int")
+
+        if type(self.mtp_rot_max_prefetch_bytes) is not int or self.mtp_rot_max_prefetch_bytes < 0:
+            raise ValueError("weight_prefetch_config.mtp_rot_max_prefetch_bytes must be a non-negative int")
 
 
 class FinegrainedTPConfig:
