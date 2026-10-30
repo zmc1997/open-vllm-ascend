@@ -49,7 +49,6 @@ constexpr int64_t CACHE_MODE_MIN = 0;
 constexpr int64_t CACHE_MODE_MAX = 3;
 constexpr int64_t QUANT_MODE_MIN = 0;
 constexpr int64_t QUANT_MODE_MAX = 3;
-constexpr uint64_t GENERIC_KERNEL_TILING_KEY = 0;
 
 struct MlaPreprocessCompileInfo {};
 
@@ -294,9 +293,8 @@ ge::graphStatus TilingMlaPreprocess(gert::TilingContext *context)
     OP_CHECK_NULL_WITH_CONTEXT(context, workspaceSizes);
     workspaceSizes[0] = static_cast<size_t>(systemWorkspaceSize + tilingData->userWorkspaceSize);
     context->SetBlockDim(platformInfo.coreNumAic);
-    // The MLA dispatch key remains in MlaTilingData::tilingKey. The CANN key
-    // selects the single generic mixed AIC/AIV entry emitted by the kernel.
-    context->SetTilingKey(GENERIC_KERNEL_TILING_KEY);
+    // Compile and select one entry for each existing MLA mode key.
+    context->SetTilingKey(tilingData->tilingKey);
     return ge::GRAPH_SUCCESS;
 }
 
