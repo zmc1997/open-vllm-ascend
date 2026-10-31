@@ -155,6 +155,30 @@ a3:
         config_base_path: tests/e2e/cases/models/configs/GLM
         size: 2
 
+  # 把 Direct 的验证拆成四个独立任务：真实权重等价、量化类型、无量化和多卡写回。
+  # 前三项使用不同权重/类型对照原 MLAPO 与 Direct，核对另存 q_c、连续 KV 和 CPU 额外写回各自行为。
+  # 最后一项在 TP0 写 CPU 池后让其他 rank 真实运行 FSA，验证写回完成通知是否足以保证读取新 KV。
+  # 真实权重测试只读取 runner 预先准备的模型缓存，不在 CI 中临时下载整个模型。
+  multi_card:
+    test_config:
+      # Require the existing Eco-Tech/GLM-5.2-w8a8 cache; tests never download it.
+      - name: mlapo-direct-equivalence-a3
+        os: linux-aarch64-a3-800i-2
+        tests: tests/e2e/nightly/single_node/ops/singlecard_ops/test_mlapo_direct_equivalence.py
+        download_path: /tmp/test-logs/mlapo-direct
+      - name: mlapo-direct-dtypes-a3
+        os: linux-aarch64-a3-800i-2
+        tests: tests/e2e/nightly/single_node/ops/singlecard_ops/test_mlapo_direct_modes.py
+      - name: mlapo-direct-no-quant-a3
+        os: linux-aarch64-a3-800i-2
+        tests: tests/e2e/nightly/single_node/ops/singlecard_ops/test_mlapo_direct_no_quant.py
+      - name: mlapo-direct-writeback-multitp-a3
+        # TP=2/4 表示分别使用 2/4 个设备协作；TP0 写共享池，其余进程从同一池运行 FSA。
+        # 这能发现单卡等价测试看不到的通知/可见性问题，因此分配能运行四卡用例的 runner。
+        os: linux-aarch64-a3-800i-4
+        tests: tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_mlapo_direct_writeback.py
+        download_path: /tmp/test-logs/mlapo-direct
+
 a3-560t:
   single_node:
     test_config:

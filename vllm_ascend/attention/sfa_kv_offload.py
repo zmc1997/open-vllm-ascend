@@ -50,6 +50,7 @@ from vllm_ascend.attention.sfa_v1 import (
     PreprocessType,
 )
 from vllm_ascend.attention.utils import (
+    MLAPO_MAX_SUPPORTED_TOKENS,
     AscendCommonAttentionMetadata,
     split_decodes_and_prefills,
 )
@@ -58,6 +59,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT,
     get_sparse_kv_offload_manager,
 )
+from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
 
 # LIM bounds mirror both BF16 and quantized kernel constants headers;
 # source-checkout tests enforce parity, independently of the draft checkpoint.
@@ -594,11 +596,197 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self.fused_overlap_last_req_ids: torch.Tensor | None = None
         self._fused_overlap_selection_capacity: tuple[int, int, int, int] | None = None
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        # 父类先选择预处理实现，并把权重整理成该实现需要的布局；随后才分配 Direct 输出。
+        # 例如本层选择 Native 时，不需要 _mlapo_current_k/_mlapo_current_rope；选择 MLAPO 时，
+        # 才能用已经准备好的 gamma2.device 和模型维度，确定当前 KV 缓冲区应该放在哪张卡、每行多宽。
+        super().process_weights_after_loading(act_dtype)
+
+        if self.preprocess_type == PreprocessType.MLAPO and not hasattr(self, "_mlapo_current_k"):
+            # Per-layer output storage is shared by graph buckets and MTP steps.
+            # Attention joins writeback before this layer can reuse the buffers.
+            # 每层保留两块最多容纳 1024 个 token 的 NPU 缓冲区，分别保存当前 K 和 K 的 RoPE 部分。
+            # 实际调用只取前 N 行；不同 batch 大小的图和 MTP 步骤共用同一块底层内存。
+            # 这样无需每轮给 KV 申请新空间，图记录的地址也能保持稳定。
+            # 复用前仍须等下游消费/写回依赖完成；“地址稳定”不代表可以提前覆盖上一轮数据。
+            device = self.gamma2.device
+            self._mlapo_current_k, self._mlapo_current_rope = (
+                torch.empty((MLAPO_MAX_SUPPORTED_TOKENS, self.kv_lora_rank), dtype=act_dtype, device=device),
+                torch.empty((MLAPO_MAX_SUPPORTED_TOKENS, self.qk_rope_head_dim), dtype=act_dtype, device=device),
+            )
+
     def _resolve_preprocess_type(self, act_dtype: torch.dtype) -> PreprocessType:
-        logger.warning_once(
-            "Sparse KV offload requires the native SFA preprocessing path; sfa_prolog_v3/mlapo is disabled."
+        # enable_mlapo=true 表示允许尝试融合 MLAPO，false 表示使用 Native 的常规预处理。
+        # 真正选中 Direct 还要求 use_fused_overlap=true、keep_device_kv_cache=false 和静态 W8A8 QKV 投影。
+        # use_fused_overlap 负责把历史 KV 加载、本批 KV 补入、注意力消费接成有依赖的执行流程；
+        # keep_device_kv_cache=false 表示不在 NPU 上另保留一份常驻分页 KV cache。
+        # 配置满足后，父类还会检查 dtype 等算子条件并准备权重；失败就记录原因并选 Native。
+        # 路径选择决定使用哪个预处理入口，不是 enable_inner_out，也不是单独的 CPU 写回开关。
+        quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
+        self._quant_type = type(quant_method) if quant_method is not None else None
+        reasons = []
+        if not self.use_fused_overlap:
+            reasons.append("use_fused_overlap=False")
+        if get_ascend_config().sparse_kv_offload_config.keep_device_kv_cache:
+            reasons.append("keep_device_kv_cache=True")
+        if not self.enable_mlapo:
+            reasons.append("enable_mlapo=False")
+        if self._quant_type is not AscendW8A8LinearMethod:
+            reasons.append(f"fused_qkv_a_proj_quant={self._quant_type}")
+        if not reasons and not self._try_enable_type(PreprocessType.MLAPO, act_dtype):
+            reasons.append("fused MLAPO unsupported")
+        if reasons:
+            logger.warning_once(
+                "Direct MLAPO was not selected for the current sparse KV offload configuration; "
+                "using Native SFA preprocessing. Reasons: %s",
+                ", ".join(reasons),
+            )
+            return PreprocessType.NATIVE
+
+        return PreprocessType.MLAPO
+
+    def _sfa_preprocess_mlapo(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        *,
+        num_input_tokens: int = 0,
+        attn_metadata: AscendSFAMetadata | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        # 本函数按以下顺序准备数据：
+        # hidden_states -> MLAPO -> ql_nope/q_pe（最终 Q）、q_c（Q 中间结果）、current_k/current_rope（当前 KV）。
+        # ql_nope/q_pe 用于注意力，q_c 用于 Indexer 选历史 token，当前 KV 交给 manager 补入本轮 KV 工作区。
+        # 本接入固定同时导出 q_c 和连续 KV；只有 TP0 还提供 CPU 池地址，让 MLAPO 额外写回历史池。
+        # 最后建立设备任务的先后关系，确保下游开始读取时对应写入已结束；Python 提交返回不代表设备已完成。
+        # 本次 token 数不能超过 1024。上层 forward 对超限调用选 Native，这里也拒绝错误直调。
+        if not 0 < num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
+            raise ValueError("Sparse KV offload MLAPO requires num_input_tokens in [1, 1024]")
+
+        manager = get_sparse_kv_offload_manager()
+        in_graph_runtime = self._in_graph_runtime()
+        # current_k/current_rope 只保存本批新生成的 KV，不是整段历史缓存。
+        # 输入第 i 行就写到这两个张量的第 i 行；例如 slots=[17,42] 时 NPU 仍写第 0/1 行，
+        # 只有额外的 CPU 写回按 17/42 定位。后续补入 FSA selection 时还有它自己的目标位置。
+        current_k = self._mlapo_current_k[:num_input_tokens]
+        current_rope = self._mlapo_current_rope[:num_input_tokens]
+        # ql_nope 是匹配压缩 K 的最终 Q 内容部分，q_pe 是最终 Q 的位置编码部分。
+        # q_c 是另一种结果：Q 投影 -> 归一化 -> 此处保存一份 q_c -> 继续量化和投影得到最终 Q。
+        # 因此 q_c 不是 KV，也不是最终 Q 又多出一个分片；当前 Indexer 用 q_c 判断要选哪些历史 token。
+        # 这里仅分配三个输出空间，下面一次 MLAPO 完成实际计算，不在 Python 中重复归一化。
+        ql_nope = torch.empty(
+            (num_input_tokens, self.W_UK_T.shape[0], self.kv_lora_rank),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
-        return PreprocessType.NATIVE
+        q_pe = torch.empty(
+            (num_input_tokens, self.W_UK_T.shape[0], self.qk_rope_head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        q_c = torch.empty(
+            (num_input_tokens, self.q_lora_rank),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        layer_name = self._offload_layer_name()
+        # The manager's v_cache_cpu is the K RoPE pool for MLA.
+        # manager 的命名沿用普通 K/V 接口；在 MLA 这里，第二个池实际存的是 K 的 RoPE 部分。
+        # 它不是另算出的一份普通 V。两个池共同保存后续注意力需要的压缩 KV 信息。
+        k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
+        writeback_args = {}
+        # TP 将注意力头等计算分到多张卡，每张卡叫一个 rank；TP0 是其中 rank=0 的卡。
+        # 每张卡都生成自身 Q 和当前 KV，但共享 CPU 池只由 TP0 更新，避免多卡写同一业务 slot。
+        # TP0：传入 manager 注册的池地址与容量；其他 rank：地址/容量保持默认 0，但五份 NPU 输出照常生成。
+        # CPU 写回不控制 q_c 是否导出。本业务选中 Direct 后，TP0 自动写回，没有额外的写回布尔配置项。
+        # 传入的必须是 NPU 可访问的映射 CPU 池，不能替换为任意普通 CPU tensor 的地址。
+        if manager.tp_rank == 0:
+            # 配置不支持时已在初始化阶段选择 Native。到这里若池不匹配，说明接线或生命周期有错误。
+            # 必须报错，不能悄悄跳过写回，否则后面的历史 KV 读取可能得到上一轮内容。
+            if (
+                not manager.use_fused_overlap
+                or k_cache_cpu is None
+                or v_cache_cpu is None
+                or k_cache_cpu.dtype != current_k.dtype
+                or v_cache_cpu.dtype != current_rope.dtype
+                or k_cache_cpu.shape[-1] != self.kv_lora_rank
+                or v_cache_cpu.shape[-1] != self.qk_rope_head_dim
+            ):
+                raise ValueError(
+                    "MLAPO fused writeback requires registered CPU pools matching the current KV dtype and width"
+                )
+            # Registration validates the pool's fixed layout and capacity.
+            # 池总元素数除以 K 的每行宽度，得到可容纳的 token 行数；capacity 不是总字节数。
+            capacity = k_cache_cpu.numel() // self.kv_lora_rank
+            writeback_args = {
+                "writeback_k_base": k_cache_cpu.data_ptr(),
+                "writeback_rope_base": v_cache_cpu.data_ptr(),
+                "writeback_capacity": capacity,
+            }
+        # 一次调用完成最终 Q、Q 中间结果 q_c 和当前 KV，使用已经准备好的原始权重、scale、offset。
+        # 在 TP0，同一次调用还把 KV 写进 CPU 池；q_c 不写入 CPU KV 池，其他 rank 也不重复写该池。
+        # 全部矩阵计算仍在 NPU 上完成，CPU 池只是 KV 的额外存储位置。
+        torch.ops._C_ascend.mla_preprocess_with_kv_offload(
+            hidden_states,
+            self.wd_qkv,
+            self.deq_scale_qkv,
+            self.gamma1,
+            self.beta1,
+            self.wu_q,
+            self.qb_deq_scl,
+            self.gamma2,
+            cos,
+            sin,
+            self.W_UK_T,
+            quant_scale0=self.quant_scale0,
+            quant_offset0=self.quant_offset0,
+            bias0=self.quant_bias_qkv,
+            quant_scale1=self.quant_scale1,
+            quant_offset1=self.quant_offset1,
+            bias1=self.qb_qt_bias,
+            ctkv_scale=self.ctkv_scale,
+            q_nope_scale=self.q_nope_scale,
+            quant_mode="per_tensor_quant_asymm",
+            q_out0=ql_nope,
+            q_out1=q_pe,
+            inner_out=q_c,
+            current_k=current_k,
+            current_rope=current_rope,
+            writeback_slots=slot_mapping,
+            **writeback_args,
+        )
+        # writeback_in_producer=True 是给 manager 的通知：“写回任务已由前面的 MLAPO 承担，不用再复制”。
+        # 这个标志不会让尚未结束的 Kernel 立即结束，也不是用来启动 CPU 写回的开关。
+        # manager 仍须保存 current_k/current_rope 的引用，并建立写回完成 -> 下游读取的先后关系。
+        # 非 TP0 也登记自身当前 KV 和参与后续通信，但实际共享 CPU 池只由 TP0 的 MLAPO 写入。
+        manager.offload_new_kv(
+            layer_name=layer_name,
+            slot_mapping=slot_mapping,
+            k_cache_cpu=k_cache_cpu,
+            v_cache_cpu=v_cache_cpu,
+            k_cache_npu=None,
+            v_cache_npu=None,
+            k=current_k,
+            v=current_rope,
+            has_prefill=False,
+            capturing=in_graph_runtime,
+            writeback_in_producer=True,
+        )
+        # Captured attention joins the writeback stream downstream. A FULL
+        # runtime Python call outside capture needs its own join after record.
+        # 捕获图时，下游注意力会把写回流的完成依赖录进图中；重放时按这些依赖执行。
+        # 若处于图运行模式，但这段 Python 调用本身是在捕获区外执行，就要在这里补上等待关系。
+        # wait_stream 让后续设备工作排在写回之后，不是让 CPU 用 synchronize 等整张卡空闲。
+        if in_graph_runtime and not _EXTRA_CTX.capturing:
+            manager.wait_for_current_kv_writeback(in_graph_runtime)
+        return hidden_states, ql_nope, q_pe, q_c
 
     @staticmethod
     def _cpu_cache_pair(manager, layer_name: str):

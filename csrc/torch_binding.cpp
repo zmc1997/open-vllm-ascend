@@ -2911,6 +2911,29 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("mla_preprocess", torch::kPrivateUse1, &vllm_ascend::mla_preprocess);
 
+    ops.def(
+        // 新入口返回五个张量：q_out0/q_out1 是最终 Q，inner_out 是 Q 中间结果，current_k/current_rope 是 KV。
+        // inner_out 与 KV 不属于同一类数据；该入口固定同时导出 Q 中间结果、连续 KV，不提供两项独立布尔参数。
+        // 五个输出先由调用方分配。a! 到 e! 表示算子会原地写入，返回 a 到 e 仍指向对应的同一份存储。
+        // 这让图编译知道输出是“写入已有张量”，不应理解为又申请了五块内存。
+        // CPU 写回另看 writeback 地址和容量：默认全为 0，只生成五份 NPU 输出；有效时再把 KV 写入 CPU 池。
+        "mla_preprocess_with_kv_offload(Tensor hiddenState, Tensor wdqkv,"
+        "                              Tensor? descale0, Tensor gamma1, Tensor? beta1, Tensor wuq, Tensor? descale1,"
+        "                              Tensor gamma2, Tensor? cos, Tensor? sin, Tensor wuk, Tensor? quant_scale0,"
+        "                              Tensor? quant_offset0, Tensor? bias0, Tensor? quant_scale1,"
+        "                              Tensor? quant_offset1, Tensor? bias1, Tensor? ctkv_scale,"
+        "                              Tensor? q_nope_scale, str? quant_mode,"
+        "                              Tensor(a!) q_out0, Tensor(b!) q_out1, Tensor(c!) inner_out,"
+        "                              Tensor(d!) current_k, Tensor(e!) current_rope,"
+        "                              Tensor? writeback_slots=None, int writeback_k_base=0,"
+        "                              int writeback_rope_base=0, int writeback_capacity=0) -> "
+        "                              (Tensor(a) q_out0, Tensor(b) q_out1, Tensor(c) inner_out,"
+        "                               Tensor(d) current_k, Tensor(e) current_rope)"
+    );
+    // PrivateUse1 是 torch_npu 使用的设备分发键；真实 NPU 张量调用会转到上面的 C++ 适配层。
+    ops.impl("mla_preprocess_with_kv_offload", torch::kPrivateUse1,
+             &vllm_ascend::mla_preprocess_with_kv_offload);
+
     ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");
     ops.impl("swap_blocks", torch::kPrivateUse1, &vllm_ascend::swap_blocks);
 #endif

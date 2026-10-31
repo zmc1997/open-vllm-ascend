@@ -2465,11 +2465,22 @@ __aicore__ __force_inline__ void PpMatmulW8a8Aiv<OutDtype, withSyncAll, quantMod
 }
 #endif
 
+// MLAPO_BF16_INNER::MLAOperation 是带 Q 中间输出的 BF16 实现：量化 hidden state 后做矩阵投影，
+// 再完成 Q/K 的归一化、量化和 RoPE，最终得到 Q、innerOut/q_c、K 和 RoPE。
+// innerOut/q_c 是 Q 归一化后、量化前的值，不是 KV；入口选择本实现来额外导出该结果。
+// quantMode 选择静态或动态量化计算；DirectOutput 这个模板参数只选择 K/RoPE 的 NPU 保存方式：
+// false 时按 slot 更新分页 cache，true 时按 token 顺序写 current_k/current_rope 连续行。
+// 因而 DirectOutput=false 也能导出 q_c。此 BF16 类没有另一个 WithInnerOut 模板参数，勿与 FP16 类混淆。
+// CPU 写回另由合法的 writebackKBase/writebackRopeBase 和非零 writebackCapacity 启用；Direct 本身不启用写回。
 template <typename InDtype, int8_t CACHE_MODE, DataFormat weightFormat1 = DataFormat::NZ,
           DataFormat weightFormat2 = DataFormat::NZ, DataFormat weightFormat3 = DataFormat::ND,
-          QuantMode quantMode = QuantMode::PER_TENSOR_ASYMM_QUANT>
+          QuantMode quantMode = QuantMode::PER_TENSOR_ASYMM_QUANT, bool DirectOutput = false>
 class MLAOperation
 {
+    static_assert(!DirectOutput || (CACHE_MODE == CACHE_MODE_KROPE_CTKV &&
+                                    (quantMode == QuantMode::PER_TENSOR_ASYMM_QUANT ||
+                                     quantMode == QuantMode::PER_TOKEN_SYMM_QUANT)),
+                  "Direct output shares the original BF16 quantized computation");
     static constexpr bool mm1WithSyncAll = (quantMode == QuantMode::PER_TOKEN_SYMM_QUANT);
     static constexpr uint64_t splitGapC = CACHE_MODE == CACHE_MODE_KVCACHE ? CONST_64 : CONST_0;
     using Q_OUT_DTYPE = typename std::conditional_t<CACHE_MODE == CACHE_MODE_INT8_NZCACHE, int8_t, InDtype>;
@@ -2500,16 +2511,22 @@ public:
         this->ropeSplitSizeTwo_ = mlaParams_.ropeSplitSizeTwo;
         this->hiddenStrideRope_ = mlaParams_.hiddenStrideRope;
         this->qkNopeHeadDim_ = mlaParams_.qkNopeHeadDim;
-        this->kv_cache_block_size_ = mlaParams_.kvCacheBlockSize == 0 ? 128U : mlaParams_.kvCacheBlockSize;
-        uint64_t defaultCacheStride0 = static_cast<uint64_t>(kv_cache_block_size_) *
-            (CACHE_MODE == CACHE_MODE_KVCACHE ? static_cast<uint64_t>(splitSizeOne_)
-                                              : static_cast<uint64_t>(splitRmsNormSizeOne_));
-        uint64_t defaultRopeStride0 =
-            static_cast<uint64_t>(kv_cache_block_size_) * static_cast<uint64_t>(splitRmsNormSizeTwo_);
-        this->kv_cache_stride0_ =
-            mlaParams_.kvCacheStride0 == 0 ? defaultCacheStride0 : mlaParams_.kvCacheStride0;
-        this->kv_cache_rope_stride0_ =
-            mlaParams_.kvCacheRopeStride0 == 0 ? defaultRopeStride0 : mlaParams_.kvCacheRopeStride0;
+        // DirectOutput=false 时按 slot 更新分页 cache，要先定位 block，再定位块内行。
+        // kv_cache_block_size_ 记录每块行数，kv_cache_stride0_/kv_cache_rope_stride0_ 记录两个缓存的跨块步长。
+        // DirectOutput=true 时，current_k/current_rope 第 0 行接收 token 0、第 1 行接收 token 1，
+        // 不用分页参数；即使额外启用 CPU 写回，CPU 行号也另由 writeback_slots 决定。
+        if constexpr (!DirectOutput) {
+            this->kv_cache_block_size_ = mlaParams_.kvCacheBlockSize == 0 ? 128U : mlaParams_.kvCacheBlockSize;
+            uint64_t defaultCacheStride0 = static_cast<uint64_t>(kv_cache_block_size_) *
+                (CACHE_MODE == CACHE_MODE_KVCACHE ? static_cast<uint64_t>(splitSizeOne_)
+                                                  : static_cast<uint64_t>(splitRmsNormSizeOne_));
+            uint64_t defaultRopeStride0 =
+                static_cast<uint64_t>(kv_cache_block_size_) * static_cast<uint64_t>(splitRmsNormSizeTwo_);
+            this->kv_cache_stride0_ =
+                mlaParams_.kvCacheStride0 == 0 ? defaultCacheStride0 : mlaParams_.kvCacheStride0;
+            this->kv_cache_rope_stride0_ =
+                mlaParams_.kvCacheRopeStride0 == 0 ? defaultRopeStride0 : mlaParams_.kvCacheRopeStride0;
+        }
     }
 
     __aicore__ inline void Init(GM_ADDR hiddenStateGm, GM_ADDR quantScale1Gm,
@@ -2528,6 +2545,15 @@ public:
         keycacheGmTensor1.SetGlobalBuffer(reinterpret_cast<__gm__ K_NOPE_DTYPE *>(keycacheOutGm));
         keycacheGmTensor2.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(keycacheOutGm2));
         slotMappingGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(slotMappingGm));
+        // DirectOutput=true 时，keycacheGmTensor1、keycacheGmTensor2 指向 NPU current_k、current_rope。
+        // writebackKGmTensor、writebackRopeGmTensor 则指向额外的 CPU K 池和 RoPE 池，二者用途不同。
+        // Host 已校验 writebackKBase/writebackRopeBase 的地址和 writebackCapacity 的行容量，
+        // 仅在 Direct 且容量非零时绑定 CPU 目的地；三项全为 0 时不写 CPU，NPU 当前 KV 仍生成。
+        // innerGmTensor 指向 q_c/innerOut，属于 Q 的额外输出，与这两个 CPU KV 池无关。
+        if (DirectOutput && mlaParams.writebackCapacity != 0) {
+            writebackKGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(mlaParams.writebackKBase));
+            writebackRopeGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(mlaParams.writebackRopeBase));
+        }
         descale1gmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(descale1Gm));
         s2GmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(s2Gm));
         s3GmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(s3Gm));
@@ -2646,6 +2672,10 @@ private:
         return blockIdx * stride0 + blockOffset * c0Size;
     }
 
+    // RmsNormAndRopeConvergence1 处理本向量核分到的 sN 个 token 的 K/RoPE，输入来自第一次矩阵投影结果。
+    // K 做归一化，RoPE 分量在 enableRope 非零时做旋转，最终值放进 UB（核内小缓冲区）的 outTmpTensor。
+    // DirectOutput 选择 NPU 输出地址：分页 cache 或 current_k/current_rope 连续行。
+    // 合法 CPU 地址和非零 writebackCapacity 再启用额外写回；本函数不处理 Q 的 innerOut/q_c 输出。
     template <class T1>
     __aicore__ inline void RmsNormAndRopeConvergence1(
         const AscendC::LocalTensor<T1> &srcTensor, const AscendC::LocalTensor<T1> &gammaTensor,
@@ -2661,23 +2691,41 @@ private:
         SET_FLAG(MTE2, V, EVENT_ID1);
         WAIT_FLAG(MTE2, V, EVENT_ID1);
         Cast(gammaFp32, gammaTensor, AscendC::RoundMode::CAST_NONE, splitRmsNormSizeOne_);
-        AscendC::DataCopyPad(slotMappingTensor, slotMappingGmTensor[slotMapGmOffset],
-                             AscendC::DataCopyExtParams(1, sN * sizeof(int32_t), 0, 0, 0),
-                             AscendC::DataCopyPadExtParams<int32_t>(false, 0, 8 - sN % 8, 0));
+        // DirectOutput=false 时，将本核的 slot 从 slotMappingGmTensor 搬进 UB 的 slotMappingTensor，
+        // 后面按这些 slot 更新分页 cache；slot=-1 可以跳过对应缓存行。
+        // DirectOutput=true 时，NPU 当前 KV 按 token 行号保存，不需要这次批量 slot 搬运。
+        // 只有 CPU 写回启用后才逐 token 读取 writebackSlot，且 writebackSlot=-1 只能跳过 CPU 复制，
+        // 仍需生成 current_k/current_rope 当前行，供后续选择缓冲区使用。
+        if constexpr (!DirectOutput) {
+            AscendC::DataCopyPad(slotMappingTensor, slotMappingGmTensor[slotMapGmOffset],
+                                 AscendC::DataCopyExtParams(1, sN * sizeof(int32_t), 0, 0, 0),
+                                 AscendC::DataCopyPadExtParams<int32_t>(false, 0, 8 - sN % 8, 0));
+        }
         if constexpr (quantMode == QuantMode::PER_TOKEN_SYMM_QUANT) {
             mmTensor = calTensor.ReinterpretCast<int32_t>()[splitSizeOne_];
             deScaleTensor = calTensor.ReinterpretCast<float>()[splitSizeOne_ * 2];
             AscendC::DataCopy(deScaleTensor, descale1gmTensor, AscendC::DataCopyParams(1, splitSizeOne_ / 8, 0, 0));
         }
-        SET_FLAG(MTE2, V, EVENT_ID2);
-        WAIT_FLAG(MTE2, V, EVENT_ID2);
-        SET_FLAG(MTE2, S, EVENT_ID2);
-        WAIT_FLAG(MTE2, S, EVENT_ID2);
+        // MTE2 从全局内存向 UB 搬数据，V 通道在 UB 上做向量计算；V 读之前必须等对应搬运完成。
+        // DirectOutput=true 且静态量化时，此处既不搬分页 slot，也不搬 descale，可跳过这组等待。
+        // quantMode=PER_TOKEN_SYMM_QUANT 时，上面仍要把反量化系数搬进 deScaleTensor，
+        // V 后面将用这些系数还原 MM1 的 INT32 结果，所以即使 Direct 也必须保留 MTE2->V 等待。
+        if constexpr (!DirectOutput || quantMode == QuantMode::PER_TOKEN_SYMM_QUANT) {
+            SET_FLAG(MTE2, V, EVENT_ID2);
+            WAIT_FLAG(MTE2, V, EVENT_ID2);
+        }
+        if constexpr (!DirectOutput) {
+            SET_FLAG(MTE2, S, EVENT_ID2);
+            WAIT_FLAG(MTE2, S, EVENT_ID2);
+        }
         for (uint64_t loop = 0; loop < sN; ++loop) {
             uint64_t offset = vectorBlockIdx * static_cast<uint64_t>(row_work) * num_col_2 + loop * mm1OutSize_;
-            int64_t slotValue = static_cast<int64_t>(slotMappingTensor.GetValue(loop));
-            if (slotValue == -1) {
-                continue;
+            int64_t slotValue = 0;
+            if constexpr (!DirectOutput) {
+                slotValue = static_cast<int64_t>(slotMappingTensor.GetValue(loop));
+                if (slotValue == -1) {
+                    continue;
+                }
             }
             if constexpr (quantMode == QuantMode::PER_TENSOR_ASYMM_QUANT) {
                 AscendC::DataCopy(srcTensor, s3GmTensor[offset],
@@ -2694,9 +2742,28 @@ private:
             }
             SET_FLAG(MTE2, V, EVENT_ID0);
             uint64_t cacheSlot = static_cast<uint64_t>(slotValue);
-            uint64_t cacheStart = GetCacheOffset(cacheSlot, splitSizeOne_, kv_cache_stride0_);
-            uint64_t cacheStart1 = GetCacheOffset(cacheSlot, splitRmsNormSizeOne_, kv_cache_stride0_);
-            uint64_t cacheStart2 = GetCacheOffset(cacheSlot, splitRmsNormSizeTwo_, kv_cache_rope_stride0_);
+            uint64_t cacheStart = 0;
+            uint64_t cacheStart1 = 0;
+            uint64_t cacheStart2 = 0;
+            int64_t writebackSlot = -1;
+            if constexpr (DirectOutput) {
+                // token 是本批输入行号；cacheStart1、cacheStart2 是 current_k、current_rope 的元素偏移。
+                // 例如 token=0、writeback_slots[0]=17：NPU 两个输出写第 0 行，额外 CPU 复制写两个池的第 17 行。
+                // 若 writeback_slots[0]=-1，NPU 第 0 行仍生成，CPU 复制跳过；CPU 写回未启用时不读取 slot。
+                // innerOut/q_c 是 Q 的额外输出，不属于 current_k/current_rope，也不参与这些行号计算。
+                // NPU current-KV outputs follow input order without paged-cache addressing.
+                const uint64_t token = static_cast<uint64_t>(vectorBlockIdx) * row_work + loop;
+                cacheStart1 = token * splitRmsNormSizeOne_;
+                cacheStart2 = token * splitRmsNormSizeTwo_;
+                if (mlaParams.writebackCapacity != 0) {
+                    // CPU writeback still uses the business slot to select the destination row.
+                    writebackSlot = static_cast<int64_t>(slotMappingGmTensor.GetValue(token));
+                }
+            } else {
+                cacheStart = GetCacheOffset(cacheSlot, splitSizeOne_, kv_cache_stride0_);
+                cacheStart1 = GetCacheOffset(cacheSlot, splitRmsNormSizeOne_, kv_cache_stride0_);
+                cacheStart2 = GetCacheOffset(cacheSlot, splitRmsNormSizeTwo_, kv_cache_rope_stride0_);
+            }
 
             SET_FLAG(S, MTE3, EVENT_ID0);
             /* RmsNorm start */
@@ -2844,6 +2911,28 @@ private:
                 DataCopy(keycacheGmTensor2[cacheStart2], outTmpTensor[splitRmsNormSizeOne_],
                          splitRmsNormSizeTwo_);
             }
+            if constexpr (DirectOutput) {
+                // outTmpTensor 前段是最终 BF16 K，后段是最终 BF16 RoPE；上面已将两段分别写到 NPU 输出。
+                // 仅当 0 <= writebackSlot < writebackCapacity 时，再向 CPU 两个池的对应行复制这两段，
+                // 不重复归一化、旋转或量化。writebackSlot=-1 或等于容量时不写 CPU，NPU 当前 KV 仍保留。
+                // GlobalTensor 下标以元素计，搬运长度以字节计，所以长度要乘 sizeof(InDtype)。
+                if (writebackSlot >= 0 && static_cast<uint64_t>(writebackSlot) < mlaParams.writebackCapacity) {
+                    // Write the same final BF16 values; invalid business slots still
+                    // retain the NPU current-KV output used by current-KV scatter.
+                    const uint64_t slot = static_cast<uint64_t>(writebackSlot);
+                    DataCopyPad(writebackKGmTensor[slot * splitRmsNormSizeOne_], outTmpTensor,
+                                AscendC::DataCopyExtParams(1, splitRmsNormSizeOne_ * sizeof(InDtype), 0, 0, 0));
+                    DataCopyPad(writebackRopeGmTensor[slot * splitRmsNormSizeTwo_],
+                                outTmpTensor[splitRmsNormSizeOne_],
+                                AscendC::DataCopyExtParams(1, splitRmsNormSizeTwo_ * sizeof(InDtype), 0, 0, 0));
+                }
+            }
+            // MTE3 异步读取 outTmpTensor，分别搬到 NPU 输出和可选的 CPU 池；发出 DataCopy 时未必读完。
+            // MTE2 下一轮会搬入新 token 的输入并复用同一段 UB，故先让 MTE2 等 MTE3 读完当前 token。
+            // 否则两个目的地可能收到 outTmpTensor 被下一行覆盖后的值。等待只保护这段 UB，
+            // 已经启动的 AIC MM2 矩阵计算仍可继续，不需要为了这次复制把整个算子串行化。
+            // Both destinations must finish reading this UB before the next
+            // row or Q vector postprocessing reuses it. Cube MM2 is already running.
             SET_FLAG(MTE3, MTE2, EVENT_ID1);
             WAIT_FLAG(MTE3, MTE2, EVENT_ID1);
         }
@@ -2893,6 +2982,8 @@ private:
     AscendC::GlobalTensor<K_NOPE_DTYPE> keycacheGmTensor1;
     AscendC::GlobalTensor<InDtype> keycacheGmTensor2;
     AscendC::GlobalTensor<int32_t> slotMappingGmTensor;
+    AscendC::GlobalTensor<InDtype> writebackKGmTensor;
+    AscendC::GlobalTensor<InDtype> writebackRopeGmTensor;
     AscendC::GlobalTensor<int8_t> wuqGmTensor;
     AscendC::GlobalTensor<InDtype> wukGmTensor;
 
@@ -2931,10 +3022,14 @@ private:
 };
 
 template <typename InDtype, int8_t CACHE_MODE, DataFormat weightFormat1, DataFormat weightFormat2,
-          DataFormat weightFormat3, QuantMode quantMode>
+          DataFormat weightFormat3, QuantMode quantMode, bool DirectOutput>
 __aicore__ inline void
-MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, quantMode>::ProcessCube()
+MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, quantMode, DirectOutput>::ProcessCube()
 {
+    // ProcessCube 是矩阵核的工作入口：mm_w8a8_aic_1 做 MM1 投影，mm_w8a8_aic_2 做 MM2 上投影，
+    // mm_ein_sum 完成最终矩阵变换。AIC 产生的结果交给 AIV 归一化/量化，AIV 的量化结果再供下一次矩阵乘使用。
+    // 因此这些矩阵阶段通过跨核事件与 ProcessVector 衔接，在一次融合调用中交替推进。
+    // DirectOutput 只改变 KV 的保存位置；入口选择此带 innerOut 的实现后仍执行全部 Q 矩阵计算。
 #ifdef __DAV_C220_CUBE__
     mm_w8a8_aic_1.Process();
     if constexpr (quantMode == QuantMode::PER_TOKEN_SYMM_QUANT) {
@@ -2955,10 +3050,14 @@ MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, q
 }
 
 template <typename InDtype, int8_t CACHE_MODE, DataFormat weightFormat1, DataFormat weightFormat2,
-          DataFormat weightFormat3, QuantMode quantMode>
+          DataFormat weightFormat3, QuantMode quantMode, bool DirectOutput>
 __aicore__ inline void
-MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, quantMode>::ProcessVector()
+MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, quantMode, DirectOutput>::ProcessVector()
 {
+    // 向量核先把 hidden state 量化好，通知矩阵核开始 MM1；随后处理投影结果的
+    // 反量化和 Q 归一化/量化，再做 K 归一化、K 的 RoPE 分量和输出搬运，最后完成 Q 的 RoPE。
+    // row_work_ 是本核实际分到的 token 数；没有分到行时跳过本地计算，
+    // 但仍参加下面的跨核事件，避免其他核因等不到“这一阶段完成”而卡住。
 #ifdef __DAV_C220_VEC__
     if (row_work_ != 0) {
         uint32_t num_col_align_int8 = (num_col_1 + REPEAT_TIME_256 - 1) / REPEAT_TIME_256 * REPEAT_TIME_256;
@@ -3018,8 +3117,14 @@ MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, q
             buf.GetBuffer<BufferType::ASCEND_UB, InDtype>(mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2);
         AscendC::LocalTensor<InDtype> cos_tensor = buf.GetBuffer<BufferType::ASCEND_UB, InDtype>(
             mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2 + splitRmsNormSizeTwo_ * 2);
-        AscendC::LocalTensor<int32_t> slotMapping_tensor = buf.GetBuffer<BufferType::ASCEND_UB, int32_t>(
-            mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2 + splitRmsNormSizeTwo_ * 4);
+        // slotMapping_tensor 是 UB 中接收分页 slot 的一段空间视图，真正输入仍是 slotMappingGmTensor。
+        // DirectOutput=false 时才将 slot 批量搬进该 UB 区域；true 时不搬，因此无需创建这个视图。
+        // Direct 的额外 CPU 写回启用后仍从 slotMappingGmTensor 逐 token 读取 writebackSlot，映射没有被删除。
+        AscendC::LocalTensor<int32_t> slotMapping_tensor;
+        if constexpr (!DirectOutput) {
+            slotMapping_tensor = buf.GetBuffer<BufferType::ASCEND_UB, int32_t>(
+                mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2 + splitRmsNormSizeTwo_ * 4);
+        }
         int32_t rms3_ub_offset =
             mm1OutSize_ * 2 + splitRmsNormSizeOne_ * 2 + splitRmsNormSizeTwo_ * 4 + 4096 * 32;
         AscendC::LocalTensor<float> tmp32_tensor = buf.GetBuffer<BufferType::ASCEND_UB, float>(rms3_ub_offset);
@@ -3073,6 +3178,15 @@ MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, q
     if constexpr (CACHE_MODE == CACHE_MODE_INT8_NZCACHE) {
         WaitFlagDev(EINSUMQUANT);
         einSumQuant.Process();
+    }
+    if constexpr (DirectOutput) {
+        if (mlaParams.writebackCapacity != 0) {
+            // writebackCapacity 非零表示 Host 已配置融合 CPU 写回，先等待本向量核的 K/RoPE 复制全部完成。
+            // 外部在本算子后记录的生产完成事件，才可同时代表 CPU 池中的 K/RoPE 已就绪。
+            // 其他流或 TP 的消费者仍通过外部流事件和 TP 通知等待；这个 PipeBarrier 只完成本核收尾。
+            // The kernel completion event must include mapped-CPU MTE3 stores.
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
     }
 #endif
 }

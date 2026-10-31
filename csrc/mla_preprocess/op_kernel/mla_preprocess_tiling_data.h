@@ -114,6 +114,17 @@ struct MlaTilingData {
     uint64_t kvCacheBlockSize{128};
     uint64_t kvCacheStride0{0};
     uint64_t kvCacheRopeStride0{0};
+    // Static mapped CPU pool identity; per-token writeback slots remain input.
+    // writebackKBase、writebackRopeBase 分别是 CPU K 池、CPU RoPE 池映射为 NPU 可访问的字节地址；
+    // writebackCapacity 是两个池各自可写的行数。DirectOutput 只改变 NPU KV 输出布局，
+    // 融合 CPU 写回还要求调用方提供合法的两个 Base 和非零 Capacity；三项全为 0 时不写 CPU。
+    // 例如 K 每行有 512 个 BF16 元素，CPU 第 17 行的字节地址是 writebackKBase + 17 * 512 * 2。
+    // 具体目标行来自 writeback_slots：token 0 的 slot=17 时，NPU 当前 KV 写第 0 行，CPU 池写第 17 行。
+    // q_c/innerOut 是额外的 Q 中间输出，与这两个 KV 池无关；关闭 CPU 写回仍会生成 Q 和 NPU 当前 KV。
+    // 图重放期间保持池地址有效，原地把 writeback_slots[0] 从 17 改为 25，下一批就改写 CPU 第 25 行。
+    uint64_t writebackKBase{0};
+    uint64_t writebackRopeBase{0};
+    uint64_t writebackCapacity{0};
 };
 
 #endif  // MLA_PREPROCESS_TILING_DATA_H

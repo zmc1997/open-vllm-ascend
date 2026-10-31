@@ -30,6 +30,7 @@ constexpr size_t INPUT_HIDDEN_STATE = 0;
 constexpr size_t INPUT_WDQKV = 3;
 constexpr size_t INPUT_GAMMA1 = 5;
 constexpr size_t INPUT_KV_CACHE = 14;
+constexpr size_t INPUT_SLOT_MAPPING = 15;
 constexpr size_t INPUT_WUK = 18;
 constexpr size_t OUTPUT_KV_CACHE_ROPE = 3;
 
@@ -39,12 +40,17 @@ constexpr size_t ATTR_ENABLE_INNER_OUT = 2;
 constexpr size_t ATTR_ENABLE_ROPE = 3;
 constexpr size_t ATTR_KV_CACHE_STRIDE0 = 4;
 constexpr size_t ATTR_KV_CACHE_ROPE_STRIDE0 = 5;
+// Host 通过属性在列表中的位置取值。新增四项接在原有六项之后，必须与 OpDef 和 ACLNN 调用对齐。
+// 例如 ATTR_WRITEBACK_CAPACITY=9 对应的是 CPU 池行容量，不能误读成前面的输出步长或地址。
+constexpr size_t ATTR_DIRECT_OUTPUT = 6;
+constexpr size_t ATTR_WRITEBACK_K_BASE = 7;
+constexpr size_t ATTR_WRITEBACK_ROPE_BASE = 8;
+constexpr size_t ATTR_WRITEBACK_CAPACITY = 9;
 
 constexpr int64_t CACHE_MODE_MIN = 0;
 constexpr int64_t CACHE_MODE_MAX = 3;
 constexpr int64_t QUANT_MODE_MIN = 0;
 constexpr int64_t QUANT_MODE_MAX = 3;
-constexpr uint64_t GENERIC_KERNEL_TILING_KEY = 0;
 
 struct MlaPreprocessCompileInfo {};
 
@@ -61,6 +67,10 @@ bool IsPhysicalNzCache(const gert::Shape &shape, int64_t cacheMode)
 
 ge::graphStatus ParseShapesAndAttrs(gert::TilingContext *context, mlapo::OpParam &opParam)
 {
+    // Host 是在 CPU 上运行的算子准备代码，负责把张量形状和选项整理成 Kernel 的执行配置。
+    // quantMode 选计算方式；enableInnerOut 选是否额外导出 Q 中间结果；directOutput 选 KV 输出布局。
+    // 这三项各管一件事。CPU 写回还需要有效池地址与容量，不能只看某个输出开关就决定。
+    // 下面先共用原输入检查，再检查 Direct 的连续输出；实际矩阵计算要等 NPU Kernel 启动后执行。
     const gert::StorageShape *hiddenStorageShape = context->GetInputShape(INPUT_HIDDEN_STATE);
     const gert::StorageShape *wdqkvStorageShape = context->GetInputShape(INPUT_WDQKV);
     const gert::StorageShape *gamma1StorageShape = context->GetInputShape(INPUT_GAMMA1);
@@ -101,12 +111,20 @@ ge::graphStatus ParseShapesAndAttrs(gert::TilingContext *context, mlapo::OpParam
     const bool *enableRopePtr = attrs->GetBool(ATTR_ENABLE_ROPE);
     const int64_t *kvCacheStride0Ptr = attrs->GetInt(ATTR_KV_CACHE_STRIDE0);
     const int64_t *kvCacheRopeStride0Ptr = attrs->GetInt(ATTR_KV_CACHE_ROPE_STRIDE0);
+    const bool *directOutputPtr = attrs->GetBool(ATTR_DIRECT_OUTPUT);
+    const int64_t *writebackKBasePtr = attrs->GetInt(ATTR_WRITEBACK_K_BASE);
+    const int64_t *writebackRopeBasePtr = attrs->GetInt(ATTR_WRITEBACK_ROPE_BASE);
+    const int64_t *writebackCapacityPtr = attrs->GetInt(ATTR_WRITEBACK_CAPACITY);
     OP_CHECK_NULL_WITH_CONTEXT(context, cacheModePtr);
     OP_CHECK_NULL_WITH_CONTEXT(context, quantModePtr);
     OP_CHECK_NULL_WITH_CONTEXT(context, enableInnerOutPtr);
     OP_CHECK_NULL_WITH_CONTEXT(context, enableRopePtr);
     OP_CHECK_NULL_WITH_CONTEXT(context, kvCacheStride0Ptr);
     OP_CHECK_NULL_WITH_CONTEXT(context, kvCacheRopeStride0Ptr);
+    OP_CHECK_NULL_WITH_CONTEXT(context, directOutputPtr);
+    OP_CHECK_NULL_WITH_CONTEXT(context, writebackKBasePtr);
+    OP_CHECK_NULL_WITH_CONTEXT(context, writebackRopeBasePtr);
+    OP_CHECK_NULL_WITH_CONTEXT(context, writebackCapacityPtr);
 
     const int64_t cacheMode = *cacheModePtr;
     const int64_t quantMode = *quantModePtr;
@@ -134,14 +152,18 @@ ge::graphStatus ParseShapesAndAttrs(gert::TilingContext *context, mlapo::OpParam
                         mlapo::MAX_SUPPORT_TOKEN_NUMS, tokenNum),
                 return ge::GRAPH_FAILED);
 
-    const int64_t kvCacheBlockSize = IsPhysicalNzCache(kvCacheShape, cacheMode)
-                                         ? kvCacheShape.GetDim(2)
-                                         : kvCacheShape.GetDim(1);
+    // 旧缓存按“页、页内位置、维度”存储，必须知道一页有多少个 token。
+    // Direct 输出只有 [本批 token 数, 每行维度]，第二维是特征宽度，不能再拿它当 block size。
+    // 因而 Direct 在这里将分页大小设为 0，后续实际写出按 token 行号处理。
+    const bool directOutput = *directOutputPtr;
+    const int64_t kvCacheBlockSize =
+        directOutput ? 0 : (IsPhysicalNzCache(kvCacheShape, cacheMode) ? kvCacheShape.GetDim(2)
+                                                                   : kvCacheShape.GetDim(1));
     int64_t qkRopeHeadDim = kvCacheRopeShape.GetDim(kvCacheRopeShape.GetDimNum() - 1);
     if (IsPhysicalNzCache(kvCacheRopeShape, cacheMode)) {
         qkRopeHeadDim = kvCacheRopeShape.GetDim(1) * kvCacheRopeShape.GetDim(3);
     }
-    OP_CHECK_IF(!IsPositiveU32(kvCacheBlockSize) || !IsPositiveU32(qkRopeHeadDim),
+    OP_CHECK_IF((!directOutput && !IsPositiveU32(kvCacheBlockSize)) || !IsPositiveU32(qkRopeHeadDim),
                 OP_LOGE(context, "cache block size and RoPE head dimension must be positive uint32 values."),
                 return ge::GRAPH_FAILED);
 
@@ -166,6 +188,70 @@ ge::graphStatus ParseShapesAndAttrs(gert::TilingContext *context, mlapo::OpParam
                                                  : mlapo::OpParam::InputDtype::FLOAT16;
     opParam.enableInnerOut = *enableInnerOutPtr;
     opParam.enableRope = *enableRopePtr;
+    opParam.directOutput = directOutput;
+    // CPU 写回必须成套配置：两个池地址都有效、capacity>0，并且 Direct 输出已开启。
+    // 全零表示不写回，例如其他 TP rank 只生成自己的 NPU 输出；只给一个地址属于配置错误。
+    // 地址还要满足 32 字节对齐，因为设备端按底层搬运指令的要求访问这块映射内存。
+    const int64_t kBase = *writebackKBasePtr;
+    const int64_t ropeBase = *writebackRopeBasePtr;
+    const int64_t capacity = *writebackCapacityPtr;
+    OP_CHECK_IF(kBase < 0 || ropeBase < 0 || capacity < 0,
+                OP_LOGE(context, "Direct CPU writeback bases and capacity must be non-negative."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF((capacity == 0 && (kBase != 0 || ropeBase != 0)) ||
+                    (capacity != 0 && (!directOutput || kBase == 0 || ropeBase == 0 ||
+                                      kBase % 32 != 0 || ropeBase % 32 != 0)),
+                OP_LOGE(context, "CPU writeback requires Direct mode and aligned mapped pool bases."),
+                return ge::GRAPH_FAILED);
+    if (directOutput) {
+        // Direct changes output destinations, not the model's compute shape.
+        // Derive output strides and CPU byte ranges from the actual dimensions.
+        // 当前 Direct 接口固定交付“最终 Q + Q 中间结果 + 当前 KV”，所以要求 enableInnerOut=true。
+        // 这是 Direct 接口的参数约定，不是说导出 Q 中间结果只能依赖 Direct；普通分页入口也有 inner 模式。
+        // Direct 的 current_k/current_rope 必须各有 tokenNum 行，K 每行宽度等于 kvLoraRank。
+        // 下面还检查维度相加、头数乘维度等计算，防止设备端 uint32 索引溢出。
+        const int64_t dimensionLimit = std::numeric_limits<uint32_t>::max();
+        const bool supportedWeights =
+            (quantMode == 0 || quantMode == 1) && wdqkvDesc->GetDataType() == ge::DT_INT8;
+        OP_CHECK_IF(!supportedWeights || cacheMode != 1 || !*enableInnerOutPtr ||
+                        kvCacheShape.GetDimNum() != 2 || kvCacheShape.GetDim(0) != tokenNum ||
+                        kvCacheShape.GetDim(1) != kvLoraRank || kvCacheRopeShape.GetDimNum() != 2 ||
+                        kvCacheRopeShape.GetDim(0) != tokenNum ||
+                        qLoraRank > dimensionLimit - kvLoraRank - qkRopeHeadDim ||
+                        qkNopeHeadDim > dimensionLimit - qkRopeHeadDim ||
+                        headNum > dimensionLimit / (qkNopeHeadDim + qkRopeHeadDim) ||
+                        headNum > dimensionLimit / kvLoraRank || headNum > dimensionLimit / tokenNum,
+                    OP_LOGE(context, "Direct MLA requires supported weights, separate contiguous KV and inner output."),
+                    return ge::GRAPH_FAILED);
+        // 开启 CPU 写回时，一行输入必须对应一个 slot，例如 slots=[17,42] 表示更新 CPU 池的 17/42 行。
+        // Host 这里只检查 slots 的形状，因为它不会把设备张量读回 CPU；正负和越界由 Kernel 检查。
+        // slots 内容可在图重放前原地更新，所以同一张图能够服务不同请求和不同 CPU 池位置。
+        if (capacity != 0) {
+            const gert::StorageShape *slotStorage = context->GetInputShape(INPUT_SLOT_MAPPING);
+            OP_CHECK_NULL_WITH_CONTEXT(context, slotStorage);
+            const gert::Shape &slotShape = slotStorage->GetOriginShape();
+            OP_CHECK_IF(slotShape.GetDimNum() != 1 || slotShape.GetDim(0) != tokenNum,
+                        OP_LOGE(context, "Direct CPU writeback requires one dynamic slot per token."),
+                        return ge::GRAPH_FAILED);
+        }
+        // The shared dtype check above permits only float16 and bfloat16.
+        // FP16/BF16 每个元素都是两字节，池范围按“容量 * 每行维度 * 两字节”计算。
+        // 先检查地址乘加不溢出，再检查 K 与 RoPE 的两个地址范围不重叠，避免相互覆盖结果。
+        constexpr int64_t elementBytes = sizeof(uint16_t);
+        const int64_t kBytes = kvLoraRank * elementBytes;
+        const int64_t ropeBytes = qkRopeHeadDim * elementBytes;
+        const int64_t limit = std::numeric_limits<int64_t>::max();
+        OP_CHECK_IF(capacity > (limit - kBase) / kBytes || capacity > (limit - ropeBase) / ropeBytes,
+                    OP_LOGE(context, "Direct CPU writeback address range overflows int64."),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(capacity != 0 && !(kBase + capacity * kBytes <= ropeBase ||
+                                      ropeBase + capacity * ropeBytes <= kBase),
+                    OP_LOGE(context, "Direct CPU K and RoPE pool ranges overlap."),
+                    return ge::GRAPH_FAILED);
+    }
+    opParam.writebackKBase = static_cast<uint64_t>(kBase);
+    opParam.writebackRopeBase = static_cast<uint64_t>(ropeBase);
+    opParam.writebackCapacity = static_cast<uint64_t>(capacity);
     opParam.qLoraRank = static_cast<uint32_t>(qLoraRank);
     opParam.qkNopeHeadDim = static_cast<uint32_t>(qkNopeHeadDim);
     opParam.qkRopeHeadDim = static_cast<uint32_t>(qkRopeHeadDim);
@@ -228,9 +314,12 @@ ge::graphStatus TilingMlaPreprocess(gert::TilingContext *context)
     OP_CHECK_NULL_WITH_CONTEXT(context, workspaceSizes);
     workspaceSizes[0] = static_cast<size_t>(systemWorkspaceSize + tilingData->userWorkspaceSize);
     context->SetBlockDim(platformInfo.coreNumAic);
-    // The MLA dispatch key remains in MlaTilingData::tilingKey. The CANN key
-    // selects the single generic mixed AIC/AIV entry emitted by the kernel.
-    context->SetTilingKey(GENERIC_KERNEL_TILING_KEY);
+    // Compile and select one entry for each existing MLA mode key.
+    // key 是一个模式编号，告诉 CANN 本次要加载哪一份已编译 Kernel，不能把它当成新计算步骤。
+    // 例如 1793 同时记录 BF16 静态量化、K/RoPE 分开存、导出 Q 中间结果和 Direct 连续 KV 输出。
+    // CANN 为 TILING_KEY_IS 中的模式分别编译，Host 在启动前选一个版本；本次只运行被选中的版本。
+    // 设备 tiling 的 key 与 SetTilingKey 必须一致，否则可能“加载一种程序，却传另一种配置”。
+    context->SetTilingKey(tilingData->tilingKey);
     return ge::GRAPH_SUCCESS;
 }
 

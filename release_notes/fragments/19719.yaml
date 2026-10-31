@@ -1,0 +1,6 @@
+# 这段发布说明描述新增能力：本批 KV 可连续输出，TP0 可在同一算子中把 KV 写入 CPU 池。
+# Q 中间结果 innerOut 是另一类输出，不写入 CPU KV 池；具体接入仍须满足指南列出的配置和数据类型条件。
+pr: 19719
+entries:
+  - category: feature
+    text: Added Direct MLAPO preprocessing for supported sparse KV offload Decode configurations, with automatic fused CPU KV writeback on TP0.

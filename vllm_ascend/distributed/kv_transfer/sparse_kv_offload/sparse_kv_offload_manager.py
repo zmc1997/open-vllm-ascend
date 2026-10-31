@@ -754,6 +754,35 @@ class SparseKVOffloadManager:
             if self.tp_rank == 0:
                 self.k_caches_cpu.append(cache_or_caches[OFFLOAD_K_CACHE_CPU_INDEX])
                 self.v_caches_cpu.append(cache_or_caches[OFFLOAD_V_CACHE_CPU_INDEX])
+                if self.use_fused_overlap:
+                    # Pool properties stay fixed until the next registration.
+                    # MLAPO 后面只拿整数地址写 CPU 池，因此先在注册时确认内存布局真的符合逐行写入约定。
+                    # 例如 K 池 dtype 与 NPU 输出不同，或者两份池可容纳的 token 数不同，都会让地址计算出错。
+                    # 这些属性在池不变时无需每轮重查；更换池并重新注册后，必须针对新池再次检查。
+                    # 上面的列表保存张量本身的引用，防止只留下裸地址、内存却已经被释放或复用。
+                    k_cpu, v_cpu = self.k_caches_cpu[-1], self.v_caches_cpu[-1]
+                    k_buffer, v_buffer = self.topk_buffers_k[-1], self.topk_buffers_v[-1]
+                    k_width, v_width = k_buffer.size(-1), v_buffer.size(-1)
+                    if (
+                        k_cpu is None
+                        or v_cpu is None
+                        or k_cpu.device.type != "cpu"
+                        or v_cpu.device.type != "cpu"
+                        or k_cpu.dtype != k_buffer.dtype
+                        or v_cpu.dtype != v_buffer.dtype
+                        or not k_cpu.is_contiguous()
+                        or not v_cpu.is_contiguous()
+                        or k_width <= 0
+                        or v_width <= 0
+                        or k_cpu.numel() % k_width
+                        or v_cpu.numel() % v_width
+                    ):
+                        raise ValueError(f"Sparse KV offload layer {layer_name}: invalid fused-overlap CPU KV pools")
+                    capacity = k_cpu.numel() // k_width
+                    if capacity <= 0 or capacity != v_cpu.numel() // v_width:
+                        raise ValueError(
+                            f"Sparse KV offload layer {layer_name}: CPU KV capacities must be positive and equal"
+                        )
 
         kv_head_num = self.topk_buffers_k[0].size(-2)
         head_dim_k = self.topk_buffers_k[0].size(-1)
@@ -792,6 +821,9 @@ class SparseKVOffloadManager:
             self.fused_plan_status_npu = self.fused_plan_metadata_npu[:1]
             self.fused_plan_current_linear_slots_npu = self.fused_plan_metadata_npu[1:]
             self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            # 集合记录哪些层已经把 CPU 写回任务交给 MLAPO；集合内有层号不代表该层的设备任务此刻已结束。
+            # 后续使用这个记录保留跨卡完成通知，防止只省掉复制，却也省掉必要的等待读取顺序。
+            self.producer_writeback_layers: set[int] = set()
         self.d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
         self.d2h_token_indices_npu = torch.arange(self.max_num_tokens, dtype=torch.int64, device=device)
 
@@ -1121,10 +1153,38 @@ class SparseKVOffloadManager:
         v: torch.Tensor | None,
         has_prefill: bool = False,
         capturing: bool = False,
+        writeback_in_producer: bool = False,
     ) -> None:
+        # k/v 是本批新 KV；在 MLA 接入中，v 参数实际保存 K 的 RoPE 部分，不是 Q 中间结果 q_c。
+        # writeback_in_producer=False：manager 按原流程提交 KV 到 CPU 的复制。
+        # writeback_in_producer=True：前面的 MLAPO 已包含 TP0 写回任务，manager 不再重复复制，只登记 KV 和完成依赖。
+        # True 是任务归属通知，不表示写入此刻已经完成；下游仍需等待设备执行到相应事件。
+        # True 仅用于已有当前 KV 的 fused-overlap 路径；capturing 参数由调用方传入图运行状态来选择流处理。
+        if writeback_in_producer and (has_prefill or not self.use_fused_overlap or k is None or v is None):
+            raise ValueError("Producer KV writeback requires current decode KV in fused-overlap mode")
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
             self.current_kv_by_layer[layer_id] = (k, v)
+            # current_kv_by_layer 保存 k/v 张量的引用，不会在这里又复制一份 KV。
+            # 同一层可能先用 Direct、下一步改用 Native，所以每次都按 writeback_in_producer 更新集合。
+            # Native 步骤必须 discard 旧标记，不能把上一轮“由 MLAPO 写回”的记录沿用到本轮。
+            if writeback_in_producer:
+                self.producer_writeback_layers.add(layer_id)
+            else:
+                self.producer_writeback_layers.discard(layer_id)
+        if writeback_in_producer:
+            # The producer's completion covers its mapped-CPU stores. Publish
+            # that completion through the same stream as external writeback.
+            # current_stream 是 MLAPO 所在的设备任务队列，current_kv_save_stream 是下游原本等待的保存队列。
+            # 在 MLAPO 后排入 current_kv_ready 事件，再让保存队列等这个事件，相当于建立：
+            # MLAPO 及 CPU 写回结束 -> current_kv_ready 完成 -> 保存队列可以继续 -> 下游再读取。
+            # record_event 返回时设备未必已执行到事件；wait_event 只安排设备顺序，不让 CPU 同步停等。
+            # 这样仍复用下游原有的等待机制，却不会多提交一次 KV 复制。
+            if self.tp_rank == 0 and capturing:
+                current_kv_ready = torch_npu.npu.current_stream().record_event()
+                with torch_npu.npu.stream(self.current_kv_save_stream):
+                    self.current_kv_save_stream.wait_event(current_kv_ready)
+            return
         use_side_stream = self.tp_rank == 0 and self.use_fused_overlap and capturing and not has_prefill
         if not use_side_stream:
             self._offload_new_kv_on_current_stream(
@@ -1348,6 +1408,10 @@ class SparseKVOffloadManager:
                         ],
                         non_blocking=True,
                     )
+                    # For producer writeback, plan_inputs_ready already covers
+                    # the CPU stores before this broadcast reaches peer TP ranks.
+                    # 本层先生成 KV，随后才记录 plan_inputs_ready，所以规划流等到事件时也已等到 CPU 写回。
+                    # 后面的广播既分发选择计划，也让其他 TP rank 按同样顺序在写回完成后使用共享池。
                 self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
             self.fused_overlap_plan_owner_layer_id = layer_id
             self.fused_overlap_plan_topk = self.topk
@@ -1465,6 +1529,18 @@ class SparseKVOffloadManager:
         flat_rope = selection_k_rope.reshape(-1, selection_k_rope.shape[-1])
         torch_npu.npu_scatter_nd_update_(flat_kv, indices, current_k)
         torch_npu.npu_scatter_nd_update_(flat_rope, indices, current_rope)
+        # selection 是本轮注意力实际读取的 KV 工作区，当前 token 的 KV 也必须补进来。
+        # 上面的 scatter 用 planner 给出的 linear_slots 定位，这个位置与 CPU 池的业务 slot 是两回事。
+        # 对 MLAPO 写回的层，补入工作区之后还需要让其他 TP rank 得知该层的 CPU 写回已经完成。
+        if layer_id in self.producer_writeback_layers:
+            # Scatter follows the producer's fused CPU writeback. The owner
+            # planner's broadcast publishes completed writes; reuse layers need
+            # their own publication, including eager calls on this stream.
+            # owner 是本轮先生成选择计划并广播的那一层，它已借该广播发布了完成依赖。
+            # 后续层可以复用相同的选择计划，但每层的 KV 数据不同，不能把 owner 的完成当成自己的完成。
+            # 因此复用计划的层仍单独广播状态；否则 peer 可能在该层 CPU 写回尚未结束时就开始读取。
+            if self.tp_size > 1 and layer_id != self.fused_overlap_plan_owner_layer_id:
+                self.tp_group.broadcast(self.fused_plan_status_npu, src=0)
 
     def wait_for_current_kv_writeback(self, capturing: bool = False) -> None:
         if self.use_fused_overlap and capturing and self.tp_rank == 0:

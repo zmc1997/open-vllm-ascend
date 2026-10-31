@@ -128,6 +128,14 @@ struct OpParam {
     InputDtype inDtype;
     bool enableInnerOut;
     bool enableRope;
+    // directOutput=true：本批第 i 个 token 的 KV 放在 NPU 输出第 i 行；false：按 slot 放进分页 cache。
+    // writebackKBase/writebackRopeBase 是可由 NPU 访问的 CPU 池起始地址，writebackCapacity 是可写行数。
+    // 三项写回参数全为 0 时不更新 CPU 池，Direct 的连续 NPU 输出仍照常生成。
+    // enableInnerOut 在上面单独定义，只控制是否导出 Q 中间结果；每轮 CPU 目标行则从 slot 输入读取。
+    bool directOutput{false};
+    uint64_t writebackKBase{0};
+    uint64_t writebackRopeBase{0};
+    uint64_t writebackCapacity{0};
     // MLA dimensions derived from tensor shapes
     uint32_t qLoraRank;
     uint32_t qkNopeHeadDim;
@@ -555,7 +563,14 @@ void MlaPreprocessTiling::SetMlapoWorkSpace()
 
 void MlaPreprocessTiling::SetTilingKey()
 {
-    uint64_t tilingKey = (static_cast<uint64_t>(opParam.enableInnerOut)) << 9;
+    // 每种设置占用不同的位：cacheMode 在低位，quantMode 从 bit3 开始，BF16 占 bit8，
+    // enableInnerOut 占 bit9，directOutput 占 bit10。位编码让多项设置组成一个唯一的模式编号。
+    // 例如 BF16 静态、分页 KV 且导出 Q 中间结果：1 + 256 + 512 = 769。
+    // 在相同计算/inner 设置上改为 Direct，只再加 1024，得到 1793；不是把 Q 中间结果改成 KV。
+    // CPU 写回和 RoPE 启停没有另加 key 位，分别由地址/容量和 enableRope 控制。
+    // 编码结果既写入设备 tiling，也交给 Host SetTilingKey，保证程序选择与参数一致。
+    uint64_t tilingKey = (static_cast<uint64_t>(opParam.directOutput)) << 10;
+    tilingKey |= (static_cast<uint64_t>(opParam.enableInnerOut)) << 9;
     tilingKey |= (static_cast<uint64_t>(opParam.inDtype == OpParam::InputDtype::BFLOAT16)) << 8;
 
     tilingKey |= static_cast<uint64_t>(opParam.cacheMode);
@@ -638,6 +653,12 @@ void MlaPreprocessTiling::Init()
     tilingData->kvCacheBlockSize = opParam.kvCacheBlockSize == 0 ? 128ULL : opParam.kvCacheBlockSize;
     tilingData->kvCacheStride0 = opParam.kvCacheStride0;
     tilingData->kvCacheRopeStride0 = opParam.kvCacheRopeStride0;
+    // Kernel 拿到这些固定地址后，才可用“Base + slot * 行字节数”直接写 CPU 池。
+    // tiling 只记录地址和容量，不持有 CPU 内存所有权；manager 必须让这两个池保持存活。
+    // slots 仍是设备输入，因此更换每轮目标行时只改输入内容，不必重新计算池地址。
+    tilingData->writebackKBase = opParam.writebackKBase;
+    tilingData->writebackRopeBase = opParam.writebackRopeBase;
+    tilingData->writebackCapacity = opParam.writebackCapacity;
 
     return;
 }

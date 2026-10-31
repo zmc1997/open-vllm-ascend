@@ -415,7 +415,12 @@ jobs:
           )
         }}
       request_id: ${{ inputs.request_id || '' }}
-      download_path: ${{ inputs.download_path }}
+      # download_path 指要收集的测试结果目录，与 MLAPO 的 Q/KV 输出张量地址无关。
+      # inputs.download_path 非空时优先收集该目录，否则使用 matrix.test_config.download_path。
+      # 例如本次 Direct 配置为 /tmp/test-logs/mlapo-direct；两处都未填时仍传空字符串。
+      # Direct 测试会输出包含数值对照、权重和二进制身份的 JSON，需要把该目录作为产物保留。
+      # 没有配置结果目录的原有用例仍传空字符串，不强行为所有 nightly 任务增加下载目录。
+      download_path: ${{ inputs.download_path || matrix.test_config.download_path || '' }}
       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || '' }}
       vllm_ref: ${{ inputs.vllm_ref || '' }}
       aop_single_enabled: ${{ inputs.aop_enabled }}

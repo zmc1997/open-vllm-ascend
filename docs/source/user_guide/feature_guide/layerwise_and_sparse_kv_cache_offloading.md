@@ -162,6 +162,49 @@ starting from `kv_port`.
 
 Note that users might encounter an error like "Sparse KV offload offload.initialize failed.". This is mainly because the contiguous host memory required by memfabric is not enough to allocate. Please refer to [memfabric-prerequisite-checks](https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/kv_cache_pool_ascend_store.html#step-1-prerequisite-checks) for preparing the host memory. Or you can consider to use lower DP size to reduce the required host memory.
 
+### Direct MLAPO with fused-overlap offload
+
+<!-- MLAPO 同时处理 Q 和 KV，阅读时先分清三个控制项：
+     enable_inner_out / WithInnerOut：是否把 Q 归一化后、量化前的中间结果另存为 innerOut，也称 q_c。
+     关闭 inner 输出仍计算最终 Q 和 KV；innerOut 不是 KV，开启 inner 输出不会把 KV 从分页缓存搬走。
+     directOutput / DirectOutput：KV 按 slot 写 NPU 分页缓存，还是按输入顺序写 current_k/current_rope。
+     CPU 池地址和容量：是否把连续 KV 额外写入 CPU 历史池，与 q_c 是否输出分开。
+     原 mla_preprocess 可以保留分页 KV 同时导出 inner；新 mla_preprocess_with_kv_offload 固定同时导出 inner 和连续 KV。
+     例如输入两行、slots=[17,-1]：Direct 生成 NPU 第 0/1 行 KV；CPU 写回开启时只更新池第 17 行。
+     最终 Q_nope/Q_rope 用于注意力；q_c 用于 Indexer；current_k/current_rope 用于本轮 KV 工作区和 CPU 写回。
+     下方配置允许选择 Direct 接入，还需要满足 BF16、静态 W8A8 等算子条件；TP0 自动负责共享 CPU 池写回。
+     其他 TP rank 生成自身 NPU 输出，并按流依赖和 TP 通知在写回结束后使用共享池。
+     图重放可原地更新输入和 slots；替换池地址则需要处理已经记录旧地址的图，不能只更新 Python 引用。
+     阅读顺序：sfa_kv_offload.py -> torch 适配层/校验 -> Host tiling -> Kernel -> offload manager。
+     测试中“原 MLAPO 与 Direct 逐位相同”只证明对应输出一致，不代替 Native 或模型级精度验证。 -->
+Direct MLAPO supports disaggregated Decode/MTP with BF16 activations and
+static W8A8 QKV/Q projections. It produces current-token KV and fuses CPU
+writeback on TP0, avoiding a separate copy.
+
+Merge these fields into the existing Decode `--additional-config`:
+
+```json
+{
+    "enable_mlapo": true,
+    "sparse_kv_offload_config": {
+        "enabled": true,
+        "use_fused_overlap": true,
+        "keep_device_kv_cache": false
+    }
+}
+```
+
+- **Path selection**: The default Copy-SFA path, configurations that do not
+  meet Direct's enablement conditions, and steps exceeding 1024 tokens use
+  Native preprocessing. Invalid tensor shapes or layouts still raise errors.
+- **Computation and dimensions**: The constraints are unchanged from the
+  original MLAPO operator. A KV LoRA rank other than 512 or a RoPE dimension
+  other than 64 triggers only a warning and requires numerical validation.
+  Bitwise equality with Native is not guaranteed.
+- **Build and validation**: Rebuild and install the ACLNN operator package
+  and PyTorch extension together. Validate numerical correctness, graph
+  replay, and multi-TP CPU writeback before deployment.
+
 ## 4. Start the P/D Proxy
 
 Start Prefill and Decode with the configurations above. After both nodes are

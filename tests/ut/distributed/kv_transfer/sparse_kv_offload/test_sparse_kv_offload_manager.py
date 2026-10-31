@@ -1,3 +1,9 @@
+# 这个文件主要检查 CPU/NPU KV 的容量规划，以及缓存注册后 manager 保存了哪些信息。
+# 本次新增用例集中在 TestHostKVRegistration：融合写回会把 CPU 池地址直接交给算子，
+# 因此必须保证地址对应的张量还活着，池更换后也要及时更新强引用、基址和容量。
+# 测试使用普通 CPU 张量模拟已分配的池；Mock 是只记录调用的替身，代替设备队列和规划器启动。
+# 这里能检查注册和拒绝非法参数的顺序；真正的设备访问、跨卡可见性由 NPU 测试另行验证。
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -409,6 +415,106 @@ if __name__ == "__main__":
 
 
 class TestHostKVRegistration(unittest.TestCase):
+    @staticmethod
+    def _make_fused_overlap_manager():
+        # use_fused_overlap=True 让注册流程保存 CPU 池强引用与裸地址，供后续融合写回取用。
+        # use_fused_copy_sfa=False 排除另一条 Copy-SFA 分支，避免把两套注册流程混在同一个断言里。
+        manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+        manager.tp_rank = 0
+        manager.num_layers = 1
+        manager.offload_layer_names = ["layer.0"]
+        manager.kv_cache_config = SimpleNamespace(num_blocks=3)
+        manager.topk_buffer_size = 256
+        manager.block_size = 128
+        manager.max_num_tokens = 2
+        manager.max_num_topk_rows = 2
+        manager.use_fused_copy_sfa = False
+        manager.use_fused_overlap = True
+        manager._register_offload_layers = MagicMock()
+        manager._init_fused_overlap_planner = MagicMock()
+        manager.tp_group = SimpleNamespace(broadcast=MagicMock())
+        return manager
+
+    @staticmethod
+    def _make_fused_overlap_cache(num_blocks=3):
+        torch = manager_module.torch
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty((num_blocks, 128, 1, 4), dtype=torch.bfloat16),
+            torch.empty((num_blocks, 128, 1, 2), dtype=torch.bfloat16),
+            torch.empty((2, 256, 1, 4), dtype=torch.bfloat16),
+            torch.empty((2, 256, 1, 2), dtype=torch.bfloat16),
+        )
+
+    def test_fused_overlap_registers_replacement_cpu_pools(self):
+        # 先注册 3 个块的池，再换成 5 个块的新池，模拟运行准备阶段重新分配缓存。
+        # block_size=128，因此可写容量从 3*128=384 行变成 5*128=640 行，不能仍沿用旧容量。
+        # 检查 manager.k_caches_cpu/v_caches_cpu 保留新张量，gvas_k_bases/gvas_v_bases 记录新基址。
+        # 强引用保证 Python 不会提前回收裸指针背后的内存，避免算子写到旧池或已释放区域。
+        torch = manager_module.torch
+        original_zeros = torch.zeros
+        original_tensor = torch.tensor
+        manager = self._make_fused_overlap_manager()
+
+        def cpu_zeros(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return original_zeros(*args, **kwargs)
+
+        def cpu_tensor(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return original_tensor(*args, **kwargs)
+
+        with (
+            patch.object(torch, "zeros", side_effect=cpu_zeros),
+            patch.object(torch, "tensor", side_effect=cpu_tensor),
+            patch.object(manager_module.torch_npu.npu, "Stream") as stream,
+        ):
+            for num_blocks in (3, 5):
+                with self.subTest(num_blocks=num_blocks):
+                    manager.kv_cache_config.num_blocks = num_blocks
+                    cache = self._make_fused_overlap_cache(num_blocks)
+                    manager.register_kv_caches({"layer.0": cache})
+                    self.assertIs(manager.k_caches_cpu[0], cache[2])
+                    self.assertIs(manager.v_caches_cpu[0], cache[3])
+                    self.assertEqual(manager.gvas_k_bases, [cache[2].data_ptr()])
+                    self.assertEqual(manager.gvas_v_bases, [cache[3].data_ptr()])
+                    self.assertEqual(manager.k_caches_cpu[0].numel() // 4, num_blocks * 128)
+                    self.assertEqual(manager.v_caches_cpu[0].numel() // 2, num_blocks * 128)
+                    self.assertEqual(manager.cpu_block_lens, [(1024, 512)])
+
+        self.assertEqual(stream.call_count, 4)
+        self.assertEqual(manager._init_fused_overlap_planner.call_count, 2)
+
+    def test_fused_overlap_rejects_invalid_cpu_pools_before_startup(self):
+        # 分别制造设备不对、类型不对、不连续、行不完整或 K/RoPE 容量不一致的池。
+        # 要求 register_kv_caches 在保存并发布这些地址前报错，连 stream/planner 都不能启动。
+        # 因而失败是可控的主机参数错误，不会把危险地址留到 NPU 执行时才暴露。
+        torch = manager_module.torch
+        invalid_pools = {
+            "non_cpu": lambda pool: torch.empty_like(pool, device="meta"),
+            "dtype": lambda pool: pool.to(torch.float16),
+            "noncontiguous": lambda pool: pool.transpose(0, 1),
+            "partial_row": lambda pool: torch.empty(pool.numel() + 1, dtype=pool.dtype),
+            "zero_capacity": lambda pool: pool[:0],
+            "unequal_capacity": lambda pool: pool[:2],
+            "missing": lambda pool: None,
+        }
+        for pool_index in (2, 3):
+            for reason, invalidate in invalid_pools.items():
+                with self.subTest(pool_index=pool_index, reason=reason):
+                    manager = self._make_fused_overlap_manager()
+                    cache = list(self._make_fused_overlap_cache())
+                    cache[pool_index] = invalidate(cache[pool_index])
+                    with (
+                        patch.object(manager_module.torch_npu.npu, "Stream") as stream,
+                        self.assertRaises(ValueError),
+                    ):
+                        manager.register_kv_caches({"layer.0": tuple(cache)})
+                    stream.assert_not_called()
+                    manager._init_fused_overlap_planner.assert_not_called()
+                    manager.tp_group.broadcast.assert_not_called()
+
     def test_copy_sfa_exports_block_byte_strides_on_all_tp_ranks(self):
         torch = manager_module.torch
         original_zeros = torch.zeros
