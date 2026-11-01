@@ -19,6 +19,7 @@
 
 #include "op_host/mla_preprocess.h"
 #include "mla_preprocess_direct_check.h"
+#include "mla_preprocess_validation.h"
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 #include <initializer_list>
 
@@ -173,7 +174,7 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     at_npu::native::OpCommand cmd;
-    cmd.Name(DirectOutput ? "mla_preprocess_without_kv_cache_write" : "mla_preprocess");
+    cmd.Name(DirectOutput ? "mla_preprocess_with_kv_offload" : "mla_preprocess");
 
     cmd.SetCustomHandler([stream, hidden_state_ptr, quant_scale0_ptr, quant_offset0_ptr, wdqkv_ptr, bias0_ptr,
                           gamma1_ptr, beta1_ptr, quant_scale1_ptr, quant_offset1_ptr, gamma2_ptr, sin_ptr, cos_ptr,
@@ -221,7 +222,7 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
 }
 
 std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
-mla_preprocess_without_kv_cache_write(
+mla_preprocess_with_kv_offload(
     const at::Tensor &hiddenState, const at::Tensor &wdqkv,
     const c10::optional<at::Tensor> &descale0, const at::Tensor &gamma1,
     const c10::optional<at::Tensor> &beta1, const at::Tensor &wuq,
@@ -237,40 +238,33 @@ mla_preprocess_without_kv_cache_write(
     const c10::optional<at::Tensor> &writeback_slots,
     int64_t writeback_k_base, int64_t writeback_rope_base, int64_t writeback_capacity)
 {
-    CheckDirectMlapo(hiddenState, wdqkv, descale0, gamma1, beta1, wuq, descale1, gamma2,
-                     cos, sin, wuk, quant_scale0, quant_offset0, bias0, quant_scale1,
-                     quant_offset1, bias1, quant_mode, q_out0, q_out1, inner_out,
-                     current_k, current_rope);
-    CheckDirectMlapoWriteback(hiddenState, writeback_slots, writeback_k_base,
-                             writeback_rope_base, writeback_capacity);
+    const int64_t quantMode = CheckDirectMlapo(hiddenState, gamma1, cos, sin, wuk, quant_mode,
+                                              q_out0, q_out1, inner_out, current_k, current_rope);
+    CheckDirectMlapoWriteback(hiddenState, current_k, current_rope, writeback_slots,
+                             writeback_k_base, writeback_rope_base, writeback_capacity);
+    CheckDirectMlapoCompute(hiddenState, wdqkv, descale0, gamma1, beta1, wuq, descale1, gamma2,
+                           cos, sin, wuk, quant_scale0, quant_offset0, bias0,
+                           quant_scale1, quant_offset1, bias1, quantMode, current_rope.size(1));
     TORCH_CHECK(hiddenState.device().type() == c10::DeviceType::PrivateUse1,
-                "mla_preprocess_without_kv_cache_write requires NPU tensors");
-    // Each scale is a scalar view into an expanded copy of the original MLAPO scale.
-    // The existing kernel copy reads a full block, so validate physical backing.
-    for (const at::Tensor *scale : {&quant_scale0.value(), &quant_scale1.value()}) {
-        const auto offset = scale->storage_offset() * scale->element_size();
-        const auto bytes = scale->storage().nbytes();
-        TORCH_CHECK(bytes >= offset && bytes - offset >= 32,
-                    "mla_preprocess_without_kv_cache_write: scale view requires at least "
-                    "32 readable storage bytes; pass a view of the expanded original scale buffer");
-    }
-    // Contiguous logical strides alone do not prove the storage has ND layout.
-    for (const at::Tensor *tensor : std::initializer_list<const at::Tensor *>{&hiddenState, &wuk, &gamma1, &gamma2,
-             &beta1.value(), &descale0.value(), &descale1.value(), &cos.value(), &sin.value(),
-             &quant_scale0.value(), &quant_scale1.value(), &quant_offset0.value(), &quant_offset1.value(),
-             &bias0.value(), &bias1.value(), &q_out0, &q_out1, &inner_out, &current_k, &current_rope}) {
+                "mla_preprocess_with_kv_offload requires NPU tensors");
+    // The 0.26 custom launcher does not perform ACLNN input-format conversion.
+    for (const at::Tensor *tensor : {&hiddenState, &wuk, &gamma1, &gamma2,
+                                    &q_out0, &q_out1, &inner_out, &current_k, &current_rope}) {
         const auto format = at_npu::native::get_npu_format(*tensor);
         TORCH_CHECK(format == ACL_FORMAT_ND || format == ACL_FORMAT_NCHW,
-                    "mla_preprocess_without_kv_cache_write requires ND-compatible input and output storage");
+                    "mla_preprocess_with_kv_offload requires ND-compatible input and output storage");
+    }
+    for (const auto *tensor : {&descale0, &beta1, &descale1, &cos, &sin, &quant_scale0, &quant_offset0,
+                              &bias0, &quant_scale1, &quant_offset1, &bias1, &writeback_slots}) {
+        if (tensor->has_value()) {
+            const auto format = at_npu::native::get_npu_format(tensor->value());
+            TORCH_CHECK(format == ACL_FORMAT_ND || format == ACL_FORMAT_NCHW,
+                        "mla_preprocess_with_kv_offload requires ND-compatible parameter storage");
+        }
     }
     TORCH_CHECK(at_npu::native::get_npu_format(wdqkv) == ACL_FORMAT_FRACTAL_NZ &&
                 at_npu::native::get_npu_format(wuq) == ACL_FORMAT_FRACTAL_NZ,
-                "mla_preprocess_without_kv_cache_write requires transformed NZ projection weights");
-    if (writeback_slots.has_value()) {
-        const auto format = at_npu::native::get_npu_format(writeback_slots.value());
-        TORCH_CHECK(format == ACL_FORMAT_ND || format == ACL_FORMAT_NCHW,
-                    "MLAPO writeback_slots requires ND-compatible storage");
-    }
+                "mla_preprocess_with_kv_offload requires transformed NZ projection weights");
     // Reuse the arithmetic and graph-safe launch. Direct tiling uses only the
     // output descriptors; optional business slots address only mapped CPU pools.
     mla_preprocess_dispatch<true>(
