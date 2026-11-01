@@ -11,6 +11,7 @@ from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+from vllm_ascend.memcache_compat import load_memcache
 
 
 def _is_device_sdma() -> bool:
@@ -74,7 +75,7 @@ class MemcacheBackend(Backend):
 
     def _setup_store(self):
         try:
-            from memcache_hybrid import DistributedObjectStore  # type: ignore
+            DistributedObjectStore = load_memcache().DistributedObjectStore
         except ImportError as e:
             raise ImportError(
                 "Please install memcache by following the instructions at "
