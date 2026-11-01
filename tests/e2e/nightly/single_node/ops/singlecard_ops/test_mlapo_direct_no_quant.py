@@ -12,8 +12,8 @@ enable_custom_op()
 @pytest.mark.parametrize("enable_rope", [True, False])
 @pytest.mark.parametrize("token_num", [1, 6, 128])
 @torch.inference_mode()
-def test_mla_preprocess_kernel(enable_rope, token_num, monkeypatch):
-    monkeypatch.setattr(torch.npu.config, "allow_internal_format", True)
+def test_mla_preprocess_kernel(enable_rope, token_num):
+    torch.npu.config.allow_internal_format = True
     _exercise_no_quant_case(enable_rope, token_num)
 
 

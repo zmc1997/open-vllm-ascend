@@ -9,7 +9,7 @@ torch tensors. A separate NPU stream reads them via offload.sparse_copy.
 
 Run explicitly with the model's NPU Python environment::
 
-    python tests/e2e/nightly/single_node/ops/singlecard_ops/test_mlapo_direct_equivalence.py \
+    python -m tests.e2e.nightly.single_node.ops.singlecard_ops.test_mlapo_direct_equivalence \
         --model-path /data/weights/GLM-5.2-w8a8 --output /actual/results.json
 
 The pytest entry uses the pre-provisioned ModelScope cache for

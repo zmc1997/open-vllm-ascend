@@ -21,6 +21,7 @@ def initialization(monkeypatch):
         sparse_kv_offload_config=SimpleNamespace(keep_device_kv_cache=False, use_fused_overlap=True)
     )
     monkeypatch.setattr(sfa, "get_ascend_config", lambda: config)
+    monkeypatch.setattr(sfa_base, "get_ascend_config", lambda: config)
     # Parent eligibility checks retain their rank-scoped warnings. This CPU
     # test has no distributed group.
     monkeypatch.setattr(vllm_logger, "_should_log_with_scope", lambda scope: True)

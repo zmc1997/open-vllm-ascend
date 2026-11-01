@@ -396,6 +396,7 @@ class TestHostKVRegistration(unittest.TestCase):
         manager.offload_layer_names = ["layer.0"]
         manager.kv_cache_config = SimpleNamespace(num_blocks=3)
         manager.topk_buffer_size = 256
+        manager.topk = 256
         manager.block_size = 128
         manager.max_num_tokens = 2
         manager.max_num_topk_rows = 2

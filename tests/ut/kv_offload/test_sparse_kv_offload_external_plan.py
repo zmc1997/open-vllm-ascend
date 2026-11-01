@@ -345,7 +345,11 @@ def test_capture_external_plan_and_current_kv_use_separate_side_streams(tp_size,
     manager.fused_plan_stream.wait_event.assert_called_once_with(plan_ready)
     manager.sparse_kv_offload_cpp.enqueue_lru_resident_compact_with_plan_stable_rows.assert_called_once()
     manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_metadata_npu, src=0)
-    manager.fused_plan_stream.wait_stream.assert_not_called()
+    if tp_size > 1:
+        # The 0.26 baseline publishes peer-visible KV before the TP broadcast.
+        manager.fused_plan_stream.wait_stream.assert_called_once_with(manager.current_kv_save_stream)
+    else:
+        manager.fused_plan_stream.wait_stream.assert_not_called()
     expected = [("record", writeback_ready), ("save_wait", writeback_ready)]
     if not producer_writeback:
         expected.append(("copy", None))

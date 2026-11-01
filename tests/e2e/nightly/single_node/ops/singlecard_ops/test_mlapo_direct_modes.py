@@ -179,9 +179,9 @@ def test_mla_direct_writeback_meta_contract(slots_kind, k_base, rope_base, capac
 @pytest.mark.parametrize("scalar_storage_tail", [False, True], ids=["scalar", "storage_tail"])
 @torch.inference_mode()
 def test_mla_preprocess_kernel(
-    cache_mode, dtype, kv_lora_rank, rope_dim, enable_rope, token_num, scalar_storage_tail, monkeypatch
+    cache_mode, dtype, kv_lora_rank, rope_dim, enable_rope, token_num, scalar_storage_tail
 ):
-    monkeypatch.setattr(torch.npu.config, "allow_internal_format", True)
+    torch.npu.config.allow_internal_format = True
     _exercise_qdown_case(
         cache_mode,
         dtype,
@@ -201,10 +201,10 @@ def test_mla_preprocess_kernel(
 @pytest.mark.parametrize("writeback_enabled", [True, False], ids=["writeback", "peer"])
 @torch.inference_mode()
 def test_mla_direct_mapped_writeback_graph(
-    dtype, kv_lora_rank, rope_dim, quant_mode, enable_rope, writeback_enabled, mapped_offload, monkeypatch
+    dtype, kv_lora_rank, rope_dim, quant_mode, enable_rope, writeback_enabled, mapped_offload
 ):
     """Independent operator checks; the offload manager still registers BF16 KV."""
-    monkeypatch.setattr(torch.npu.config, "allow_internal_format", True)
+    torch.npu.config.allow_internal_format = True
     _exercise_qdown_case(
         "krope_ctkv", dtype, kv_lora_rank, rope_dim, enable_rope, 6, mapped_offload, quant_mode, writeback_enabled
     )

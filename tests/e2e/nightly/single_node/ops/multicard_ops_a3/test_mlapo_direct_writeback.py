@@ -73,6 +73,7 @@ def _manager(rank, group, slots):
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.tp_rank, manager.tp_size, manager.tp_group = rank, group.world_size, group
     manager.use_fused_overlap = True
+    manager.fused_async_plan = True
     manager.layer_name_to_offload_id = {LAYER: 0}
     manager.offload_layer_names = [LAYER]
     manager.current_kv_by_layer = {}
@@ -97,6 +98,8 @@ def _case(rank, group, model_path):
     sin = torch.empty_like(cos)
     compact = torch.arange(TOKENS, dtype=torch.int32, device=device)
     slots = torch.empty(TOKENS, dtype=torch.int32, device=device)
+    selection_slots = torch.empty_like(slots)
+    manager = _manager(rank, group, selection_slots)
 
     reference = _make_case(torch.bfloat16, TOPK)
     baseline = (reference.full_kv_cache.cpu(), reference.full_k_rope.cpu())
@@ -106,12 +109,20 @@ def _case(rank, group, model_path):
     group.broadcast(addresses, src=0)
     torch.npu.synchronize()
     if rank != 0:
+        manager._build_cpp()
         pools = tuple(
-            torch.ops._C_ascend.sparse_kv_restore_bfloat16_tensor(int(ptr), shape)
+            manager._restore_bfloat16_tensor(int(ptr), shape)
             for ptr, shape in zip(addresses.cpu().tolist(), shapes)
         )
     assert all(pool.data_ptr() == ptr for pool, ptr in zip(pools, addresses.cpu().tolist()))
     flat_pools = tuple(pool.view(-1, pool.shape[-1]) for pool in pools)
+    readback = tuple(torch.empty(shape, dtype=torch.bfloat16, device=device) for shape in shapes)
+    read_src = torch.tensor([pool.data_ptr() for pool in pools], dtype=torch.int64, device=device)
+    read_dst = torch.tensor([value.data_ptr() for value in readback], dtype=torch.int64, device=device)
+    read_sizes = torch.tensor(
+        [pool.numel() * pool.element_size() for pool in pools], dtype=torch.int32, device=device
+    )
+    read_count = torch.tensor([len(pools)], dtype=torch.int32, device=device)
     reference.topk_indices.copy_(torch.arange(TOPK, dtype=torch.int32, device=device).view(1, 1, TOPK))
     reference.query = torch.empty(1, d["heads"], d["kv"] + d["rope"], dtype=x.dtype, device=device)
     actual = replace(
@@ -124,8 +135,6 @@ def _case(rank, group, model_path):
         selection_block_status=reference.selection_block_status.clone(),
         selection_membership_map=reference.selection_membership_map.clone(),
     )
-    selection_slots = torch.empty_like(slots)
-    manager = _manager(rank, group, selection_slots)
     shared_block = int(reference.full_block_table.cpu()[0, 0])
     selection_block = int(reference.selection_block_table.cpu()[0, 0])
     slot_ids: list[int] = []
@@ -199,9 +208,19 @@ def _case(rank, group, model_path):
         # Deliberately after the entire Direct -> notification -> FSA chain.
         torch.npu.synchronize()
         values = {name: exact(out[name], old[name], (label, rank, name)) for name in OUTPUTS}
-        for pool, expected, name in zip(pools, expected_pools, ("current_k", "current_rope")):
-            values[name + "_cpu_pool"] = exact(pool, expected, (label, rank, "shared CPU pool", name))
-        _assert_selection_state_matches_full_cache(actual)
+        # SHARED peer GVA is device-visible in memfabric 1.2.1; it must not be
+        # dereferenced on the peer CPU. Validate every rank through the actual
+        # device copy, and additionally validate the owner's CPU allocation.
+        rc = offload.sparse_copy(read_src, read_dst, read_sizes, read_count, x.device)
+        assert rc in (None, 0), rc
+        torch.npu.synchronize()
+        for pool, read, expected, name in zip(pools, readback, expected_pools, ("current_k", "current_rope")):
+            values[name + "_shared_pool_readback"] = exact(read, expected, (label, rank, "shared GVA readback", name))
+            if rank == 0:
+                values[name + "_cpu_pool"] = exact(pool, expected, (label, rank, "shared CPU pool", name))
+        _assert_selection_state_matches_full_cache(
+            replace(actual, full_kv_cache=readback[0], full_k_rope=readback[1])
+        )
         expected = _call_fused(reference)
         torch.npu.synchronize()
         values["fsa"] = exact(result, expected, (label, rank, "FSA CPU pool vs original-MLAPO KV"))
@@ -223,6 +242,7 @@ def _case(rank, group, model_path):
         torch.ops._C_ascend.mla_preprocess_prepare_tiling()
     with torch.npu.graph(graph, stream=stream, capture_error_mode="global"):
         captured_output = launch(True)
+    graph.replay()
     rows.append(check("graph_capture", captured_output))
     for iteration in (2, 3):
         update(iteration)
