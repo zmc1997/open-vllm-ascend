@@ -248,7 +248,7 @@ mla_preprocess_with_kv_offload(
     TORCH_CHECK(hiddenState.device().type() == c10::DeviceType::PrivateUse1,
                 "mla_preprocess_with_kv_offload requires NPU tensors");
     // The 0.26 custom launcher does not perform ACLNN input-format conversion.
-    for (const at::Tensor *tensor : {&hiddenState, &wuk, &gamma1, &gamma2,
+    for (const at::Tensor *tensor : std::initializer_list<const at::Tensor *>{&hiddenState, &wuk, &gamma1, &gamma2,
                                     &q_out0, &q_out1, &inner_out, &current_k, &current_rope}) {
         const auto format = at_npu::native::get_npu_format(*tensor);
         TORCH_CHECK(format == ACL_FORMAT_ND || format == ACL_FORMAT_NCHW,
