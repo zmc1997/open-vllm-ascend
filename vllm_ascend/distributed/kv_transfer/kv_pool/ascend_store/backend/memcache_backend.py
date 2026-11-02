@@ -1,10 +1,8 @@
 # Standard
 import os
-import sys
 import threading
 import time
 from enum import Enum
-from importlib._bootstrap import _ImportLockContext
 from typing import Any
 
 import torch
@@ -75,21 +73,14 @@ class MemcacheBackend(Backend):
             self._register_buffers_if_needed()
 
     def _setup_store(self):
-        with _ImportLockContext():
-            dlopen_flags = sys.getdlopenflags()
-            try:
-                # Official SDK network symbols have incompatible layouts. Scope
-                # their bindings to Memcache; dlopen flags are interpreter-wide.
-                sys.setdlopenflags(dlopen_flags | os.RTLD_DEEPBIND)
-                from memcache_hybrid import DistributedObjectStore  # type: ignore
-            except ImportError as e:
-                raise ImportError(
-                    "Please install memcache by following the instructions at "
-                    "https://gitee.com/ascend/memfabric_hybrid "  # noqa: E501
-                    "to run vLLM with MemcacheConnector."
-                ) from e
-            finally:
-                sys.setdlopenflags(dlopen_flags)
+        try:
+            from memcache_hybrid import DistributedObjectStore  # type: ignore
+        except ImportError as e:
+            raise ImportError(
+                "Please install memcache by following the instructions at "
+                "https://gitee.com/ascend/memfabric_hybrid "  # noqa: E501
+                "to run vLLM with MemcacheConnector."
+            ) from e
 
         store = DistributedObjectStore()
 

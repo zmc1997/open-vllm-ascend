@@ -3,19 +3,16 @@
 These are control-flow checks, not tensor numerical or NPU execution tests.
 """
 
-import _imp
 import argparse
 import ast
-import builtins
 import itertools
 import sys
 import unittest
 from contextlib import nullcontext
 from enum import Enum
-from importlib._bootstrap import _ImportLockContext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 _ROOT = Path(__file__).resolve().parents[3]
 _SFA = "vllm_ascend/attention/sfa_kv_offload.py"
@@ -61,53 +58,6 @@ class _View:
 
 
 class TestMlapoBackportControlFlow(unittest.TestCase):
-    def test_memcache_import_restores_flags_and_lock_on_success_and_failure(self):
-        original_import = builtins.__import__
-        for error in (None, ImportError("missing SDK"), RuntimeError("native import failed")):
-            with self.subTest(error=type(error).__name__):
-                runtime = SimpleNamespace(getdlopenflags=lambda: 2, setdlopenflags=Mock())
-                store = Mock()
-                store.init.return_value = 0
-
-                def construct_store(runtime=runtime, store=store):
-                    self.assertFalse(_imp.lock_held())
-                    self.assertEqual(runtime.setdlopenflags.call_args.args, (2,))
-                    return store
-
-                def sdk_import(name, *args, import_error=error, runtime=runtime, constructor=construct_store, **kwargs):
-                    if name == "memcache_hybrid":
-                        self.assertTrue(_imp.lock_held())
-                        self.assertEqual(runtime.setdlopenflags.call_args.args, (2 | 8,))
-                        if import_error is not None:
-                            raise import_error
-                        return SimpleNamespace(DistributedObjectStore=constructor)
-                    return original_import(name, *args, **kwargs)
-
-                setup = _load_method(
-                    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py",
-                    "_setup_store",
-                    {
-                        "sys": runtime,
-                        "os": SimpleNamespace(RTLD_DEEPBIND=8),
-                        "_ImportLockContext": _ImportLockContext,
-                        "time": SimpleNamespace(sleep=Mock()),
-                        "MEMCACHE_THREAD_START_WAIT_S": object(),
-                        "logger": Mock(),
-                    },
-                )
-                backend = SimpleNamespace(local_rank=0, _init_bm=False)
-                with patch.object(builtins, "__import__", side_effect=sdk_import):
-                    if error is None:
-                        self.assertIs(setup(backend), store)
-                        store.init.assert_called_once_with(0, init_bm=False)
-                    else:
-                        with self.assertRaises(type(error)) as caught:
-                            setup(backend)
-                        propagated = caught.exception.__cause__ if isinstance(error, ImportError) else caught.exception
-                        self.assertIs(propagated, error)
-                self.assertEqual(runtime.setdlopenflags.call_args.args, (2,))
-                self.assertFalse(_imp.lock_held())
-
     def test_official_store_endpoint_is_shared_by_tp_and_separated_by_dp(self):
         tree = ast.parse((_ROOT / _MANAGER).read_text(encoding="utf-8"))
         initialize = next(
