@@ -1,8 +1,10 @@
 # Standard
 import os
+import sys
 import threading
 import time
 from enum import Enum
+from importlib._bootstrap import _ImportLockContext
 from typing import Any
 
 import torch
@@ -11,7 +13,6 @@ from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
-from vllm_ascend.memcache_compat import load_memcache
 
 
 def _is_device_sdma() -> bool:
@@ -74,14 +75,21 @@ class MemcacheBackend(Backend):
             self._register_buffers_if_needed()
 
     def _setup_store(self):
-        try:
-            DistributedObjectStore = load_memcache().DistributedObjectStore
-        except ImportError as e:
-            raise ImportError(
-                "Please install memcache by following the instructions at "
-                "https://gitee.com/ascend/memfabric_hybrid "  # noqa: E501
-                "to run vLLM with MemcacheConnector."
-            ) from e
+        with _ImportLockContext():
+            dlopen_flags = sys.getdlopenflags()
+            try:
+                # Official SDK network symbols have incompatible layouts. Scope
+                # their bindings to Memcache; dlopen flags are interpreter-wide.
+                sys.setdlopenflags(dlopen_flags | os.RTLD_DEEPBIND)
+                from memcache_hybrid import DistributedObjectStore  # type: ignore
+            except ImportError as e:
+                raise ImportError(
+                    "Please install memcache by following the instructions at "
+                    "https://gitee.com/ascend/memfabric_hybrid "  # noqa: E501
+                    "to run vLLM with MemcacheConnector."
+                ) from e
+            finally:
+                sys.setdlopenflags(dlopen_flags)
 
         store = DistributedObjectStore()
 
