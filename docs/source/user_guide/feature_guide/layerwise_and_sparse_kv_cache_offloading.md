@@ -197,6 +197,24 @@ Merge these fields into the existing Decode `--additional-config`:
   and PyTorch extension together. Validate numerical correctness, graph
   replay, and multi-TP CPU writeback before deployment.
 
+### SFA Indexer Q/K overlap
+
+Set `multistream_sfa_indexer_overlap` to `true` in `--additional-config`
+to overlap Native and MLAPO SFA's Indexer Q projection with K preprocessing. It is
+`false` by default. Q quantization overlaps the K projection, then the Q
+matmul overlaps K's normalization and RoPE. Stream waits separate the Cube
+matmuls. The existing Indexer Q Triton quantization switch remains effective.
+When `skip_topk` reuses cached indices, Q projection and its stream waits are
+skipped; K preprocessing, K/scale cache updates and notifications still run.
+For MLAPO, including Direct KV offload, the fused producer runs first to
+provide `q_c`; the same Q/K stream schedule then runs before Indexer cache
+writes. The auxiliary stream waits for the producer and K projection; the
+main stream joins Q before K Hadamard. With the switch off, the original
+K-before-MLAPO order is retained. PROLOG scheduling is unchanged. The changed
+order can expose prefetch or connector waits, so model benefit requires
+device measurements; the two overlap windows are not an ITL guarantee.
+Direct MLAPO and PROLOG_V3 retain their existing Indexer schedule.
+
 ## 4. Use Them Together
 
 The combined data flow is:
