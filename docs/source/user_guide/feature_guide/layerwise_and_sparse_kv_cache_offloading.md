@@ -201,19 +201,19 @@ Merge these fields into the existing Decode `--additional-config`:
 
 Set `multistream_sfa_indexer_overlap` to `true` in `--additional-config`
 to overlap Native and MLAPO SFA's Indexer Q projection with K preprocessing. It is
-`false` by default. Q quantization overlaps the K projection, then the Q
-matmul overlaps K's normalization and RoPE. Stream waits separate the Cube
+`false` by default. Native overlaps Q quantization with the K projection, then
+the Q matmul with K normalization and RoPE. Stream waits separate the Cube
 matmuls. The existing Indexer Q Triton quantization switch remains effective.
 When `skip_topk` reuses cached indices, Q projection and its stream waits are
 skipped; K preprocessing, K/scale cache updates and notifications still run.
-For MLAPO, including Direct KV offload, the fused producer runs first to
-provide `q_c`; the same Q/K stream schedule then runs before Indexer cache
-writes. The auxiliary stream waits for the producer and K projection; the
-main stream joins Q before K Hadamard. With the switch off, the original
-K-before-MLAPO order is retained. PROLOG scheduling is unchanged. The changed
-order can expose prefetch or connector waits, so model benefit requires
-device measurements; the two overlap windows are not an ITL guarantee.
-Direct MLAPO and PROLOG_V3 retain their existing Indexer schedule.
+For MLAPO, including Direct KV offload, K is projected once before the fused
+producer. After the complete producer makes `q_c` ready, Q quantization runs
+on the main stream, followed by the auxiliary Q matmul overlapping main-stream
+K normalization and RoPE. The main stream joins Q before K Hadamard and cache
+writes. This gives up the short quantization overlap to remove one stream
+handoff. With the switch off, the original K-before-MLAPO order is retained.
+PROLOG scheduling is unchanged. Measure the complete model: these windows
+do not guarantee an ITL improvement.
 
 ### Experimental GLM weight prefetch
 

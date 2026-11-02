@@ -1549,14 +1549,20 @@ class AscendSFAImpl(MLAAttentionImpl):
         q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         cos: torch.Tensor,
         sin: torch.Tensor,
+        indexer_kw: torch.Tensor | None = None,
     ):
         indexer_aux_stream = attention_calculation_stream()
         main_stream = torch.npu.current_stream()
-        # Wait for q_c, including the fused MLAPO producer, before reading it.
-        indexer_aux_stream.wait_stream(main_stream)
-        with npu_stream_switch(indexer_aux_stream, enabled=True):
+        if indexer_kw is None:
+            # Native overlaps Q quantization with the K Cube projection.
+            indexer_aux_stream.wait_stream(main_stream)
+            with npu_stream_switch(indexer_aux_stream, enabled=True):
+                indexer_q_quant = self._indexer_q_quantize(q_c)
+            indexer_kw, _ = self.wk_weights_proj(hidden_states)
+        else:
+            # MLAPO has completed q_c on this stream; K was projected before it.
+            # Keep the short quantization here to avoid an extra stream handoff.
             indexer_q_quant = self._indexer_q_quantize(q_c)
-        indexer_kw, _ = self.wk_weights_proj(hidden_states)
         # Keep Q and K Cube projections apart; overlap Q with K Vector work.
         indexer_aux_stream.wait_stream(main_stream)
         with npu_stream_switch(indexer_aux_stream, enabled=True):
@@ -1995,8 +2001,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "SFA Prolog V3 requires one cache index per input token, "
                     f"got token_x={hidden_states.shape[0]} and cache_index={slot_mapping.numel()}."
                 )
-            if self.has_indexer and not overlap_mlapo_indexer:
+            if self.has_indexer:
                 indexer_kw, _ = self.wk_weights_proj(hidden_states)
+            if self.has_indexer and not overlap_mlapo_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(kw=indexer_kw, cos=cos, sin=sin)
             else:
                 k_li, k_li_scale = None, None
@@ -2020,7 +2027,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     num_input_tokens=num_input_tokens,
                 )
             if overlap_mlapo_indexer:
-                indexer_kw, k_li, k_li_scale, indexer_q_li = self._indexer_qk_pre_process(hidden_states, q_c, cos, sin)
+                indexer_kw, k_li, k_li_scale, indexer_q_li = self._indexer_qk_pre_process(
+                    hidden_states, q_c, cos, sin, indexer_kw=indexer_kw
+                )
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."

@@ -2,6 +2,7 @@
 
 import ast
 import os
+import sys
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 _SOURCE = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_v1.py"
+_COMPILER_SOURCE = _SOURCE.parents[1] / "compilation/compiler_interface.py"
 
 
 def _method(name, namespace):
@@ -99,11 +101,35 @@ class TestSFAIndexerOverlapControlFlow(unittest.TestCase):
                 self._check_overlap(enabled, skip_topk=True)
 
     def test_mlapo_overlap_uses_fused_q_and_preserves_cached_topk(self):
-        for enabled in (False, True):
-            for skip_topk in (False, True):
-                for speculative in (False, True):
-                    with self.subTest(enabled=enabled, skip_topk=skip_topk, speculative=speculative):
-                        self._check_overlap(enabled, skip_topk, mode="mlapo", speculative=speculative)
+        for mode in ("mlapo", "direct"):
+            for enabled in (False, True):
+                for skip_topk in (False, True):
+                    for speculative in (False, True):
+                        with self.subTest(mode=mode, enabled=enabled, skip_topk=skip_topk, speculative=speculative):
+                            self._check_overlap(enabled, skip_topk, mode=mode, speculative=speculative)
+
+    def test_overlap_schedule_versions_compiler_cache(self):
+        tree = ast.parse(_COMPILER_SOURCE.read_text(encoding="utf8"))
+        method = next(
+            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "compute_hash"
+        )
+        config = SimpleNamespace(
+            ascend_compilation_config=SimpleNamespace(enable_npugraph_ex=True, enable_static_kernel=False),
+            multistream_sfa_indexer_overlap=False,
+            weight_prefetch_config=None,
+        )
+        namespace = {"get_ascend_config": lambda: config, "logger": Mock()}
+        module = ast.Module(
+            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(_COMPILER_SOURCE), "exec"), namespace)
+        with patch.dict(sys.modules, {"torch_npu": SimpleNamespace(__version__="test")}):
+            compiler = SimpleNamespace()
+            disabled = namespace["compute_hash"](compiler, object())
+            config.multistream_sfa_indexer_overlap = True
+            enabled = namespace["compute_hash"](compiler, object())
+        self.assertNotEqual(enabled, disabled)
 
     def test_prolog_keeps_original_indexer_order(self):
         for skip_topk in (False, True):
@@ -138,7 +164,7 @@ class TestSFAIndexerOverlapControlFlow(unittest.TestCase):
             enable_sp=False,
             enable_dsa_cp_with_o_proj_tp=False,
             has_indexer=has_indexer,
-            preprocess_type={"native": native, "mlapo": mlapo, "prolog": prolog}[mode],
+            preprocess_type={"native": native, "mlapo": mlapo, "direct": mlapo, "prolog": prolog}[mode],
             enable_indexer_multistream=enabled,
             skip_topk=skip_topk,
             use_index_cache=True,
@@ -177,12 +203,13 @@ class TestSFAIndexerOverlapControlFlow(unittest.TestCase):
             _update_indexcache_topk_indices=Mock(),
             _execute_sparse_flash_attention_process=Mock(side_effect=Boundary),
             _sfa_preprocess_mlapo=Mock(
-                side_effect=lambda **_kwargs: events.append("mlapo") or (hidden_states, ql_nope, q_pe, q_c)
+                side_effect=lambda **_kwargs: events.append(mode) or (hidden_states, ql_nope, q_pe, q_c)
             ),
             _sfa_preprocess_prolog_v3=Mock(
                 side_effect=lambda **_kwargs: events.append("prolog") or (hidden_states, ql_nope, q_pe, q_c)
             ),
         )
+        stream_switch = Mock(side_effect=lambda *_args, **_kwargs: nullcontext())
         namespace = {
             "AscendAttentionState": states,
             "PreprocessType": SimpleNamespace(NATIVE=native, MLAPO=mlapo, PROLOG_V3=prolog),
@@ -190,13 +217,13 @@ class TestSFAIndexerOverlapControlFlow(unittest.TestCase):
             "torch": SimpleNamespace(npu=SimpleNamespace(current_stream=current_stream)),
             "os": os,
             "attention_calculation_stream": auxiliary_stream,
-            "npu_stream_switch": lambda *_args, **_kwargs: nullcontext(),
+            "npu_stream_switch": stream_switch,
             "wait_for_kv_layer_from_connector": lambda _: events.append("kv_wait"),
             "notify_kv_cache_written": lambda _: events.append("notify"),
             "record_attention_compute_start": lambda: events.append("prefetch_gate"),
         }
         impl._indexer_qk_pre_process = Mock(
-            side_effect=lambda *args: _method("_indexer_qk_pre_process", namespace)(impl, *args)
+            side_effect=lambda *args, **kwargs: _method("_indexer_qk_pre_process", namespace)(impl, *args, **kwargs)
         )
         forward = _method("forward", namespace)
         metadata = SimpleNamespace(
@@ -219,13 +246,16 @@ class TestSFAIndexerOverlapControlFlow(unittest.TestCase):
         ]
         overlap = has_indexer and enabled and not skip_topk and mode != "prolog"
         if overlap:
+            if mode == "native":
+                prefix = ["q_norm", "aux_wait_main", "q_quant", "k_matmul"]
+                impl._indexer_qk_pre_process.assert_called_once_with(hidden_states, q_c, None, None)
+            else:
+                prefix = ["k_matmul", "kv_wait", mode, "q_quant"]
+                impl._indexer_qk_pre_process.assert_called_once_with(hidden_states, q_c, None, None, indexer_kw=kw)
             self.assertEqual(
                 events,
-                (["q_norm"] if mode == "native" else ["kv_wait", "mlapo"])
+                prefix
                 + [
-                    "aux_wait_main",
-                    "q_quant",
-                    "k_matmul",
                     "aux_wait_main",
                     "q_matmul",
                     "k_vector",
@@ -239,7 +269,7 @@ class TestSFAIndexerOverlapControlFlow(unittest.TestCase):
             impl._indexer_pre_c8_quant.assert_called_once_with(k_li)
             impl._indexer_q_quantize.assert_called_once_with(q_c)
             impl._indexer_q_matmul.assert_called_once_with(quantized_q, hidden_states)
-            impl._indexer_qk_pre_process.assert_called_once_with(hidden_states, q_c, None, None)
+            self.assertEqual(stream_switch.call_count, 2 if mode == "native" else 1)
             impl.indexer_select_pre_process.assert_not_called()
         else:
             k_events = ["k_matmul"] if has_indexer else []
@@ -262,7 +292,7 @@ class TestSFAIndexerOverlapControlFlow(unittest.TestCase):
             impl._q_proj_and_k_up_proj.assert_not_called()
             impl.fused_qkv_a_proj.assert_not_called()
             impl.q_a_layernorm.assert_not_called()
-            fused = impl._sfa_preprocess_mlapo if mode == "mlapo" else impl._sfa_preprocess_prolog_v3
+            fused = impl._sfa_preprocess_mlapo if mode in ("mlapo", "direct") else impl._sfa_preprocess_prolog_v3
             fused.assert_called_once()
             self.assertIs(impl._execute_sparse_flash_attention_process.call_args.args[0], ql_nope)
             self.assertIs(impl._execute_sparse_flash_attention_process.call_args.args[1], q_pe)
