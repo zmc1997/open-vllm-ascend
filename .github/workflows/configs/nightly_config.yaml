@@ -216,6 +216,21 @@ a3:
         config_file_path: Minimax_m2.7_w8a8_A3.yaml
   multi_card:
     test_config:
+      # Require the existing Eco-Tech/GLM-5.2-w8a8 cache; tests never download it.
+      - name: mlapo-direct-equivalence-a3
+        os: linux-aarch64-nightly-a3-2
+        tests: tests/e2e/nightly/single_node/ops/singlecard_ops/test_mlapo_direct_equivalence.py
+        download_path: /tmp/test-logs/mlapo-direct
+      - name: mlapo-direct-dtypes-a3
+        os: linux-aarch64-nightly-a3-2
+        tests: tests/e2e/nightly/single_node/ops/singlecard_ops/test_mlapo_direct_modes.py
+      - name: mlapo-direct-no-quant-a3
+        os: linux-aarch64-nightly-a3-2
+        tests: tests/e2e/nightly/single_node/ops/singlecard_ops/test_mlapo_direct_no_quant.py
+      - name: mlapo-direct-writeback-multitp-a3
+        os: linux-aarch64-nightly-a3-4
+        tests: tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_mlapo_direct_writeback.py
+        download_path: /tmp/test-logs/mlapo-direct
       # pytest-driven tests
       - name: qwen3-30b-acc
         os: linux-aarch64-nightly-a3-4

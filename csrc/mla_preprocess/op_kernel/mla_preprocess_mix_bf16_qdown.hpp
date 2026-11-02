@@ -419,8 +419,10 @@ public:
 
         SET_FLAG(MTE2, V, EVENT_ID1);
         if constexpr (quantMode == QuantMode::PER_TENSOR_ASYMM_QUANT) {
-            AscendC::DataCopy(quantScaleTensor, quantScaleGmTensor, AscendC::DataCopyParams(1, 1, 0, 0));
-            AscendC::DataCopy(quantOffsetTensor, quantOffsetGmTensor, AscendC::DataCopyParams(1, 1, 0, 0));
+            gm_to_ub_align<ArchType::ASCEND_V220, T>(
+                quantScaleTensor, quantScaleGmTensor, 0, 1, sizeof(T), 0, 0, 0, 0);
+            gm_to_ub_align<ArchType::ASCEND_V220, int8_t>(
+                quantOffsetTensor, quantOffsetGmTensor, 0, 1, sizeof(int8_t), 0, 0, 0, 0);
         }
 
         if constexpr (NEED_DEQUANT) {
@@ -688,8 +690,10 @@ public:
                           AscendC::DataCopyParams(1, (num_col_ - input_stride_) / BLOCK_SIZE_16, 0, 0));
         SET_FLAG(MTE2, V, EVENT_ID1);
         if constexpr (quantMode == QuantMode::PER_TENSOR_ASYMM_QUANT) {
-            AscendC::DataCopy(quantScaleTensor, quantScaleGmTensor, AscendC::DataCopyParams(1, 1, 0, 0));
-            AscendC::DataCopy(quantOffsetTensor, quantOffsetGmTensor, AscendC::DataCopyParams(1, 1, 0, 0));
+            gm_to_ub_align<ArchType::ASCEND_V220, T>(
+                quantScaleTensor, quantScaleGmTensor, 0, 1, sizeof(T), 0, 0, 0, 0);
+            gm_to_ub_align<ArchType::ASCEND_V220, int8_t>(
+                quantOffsetTensor, quantOffsetGmTensor, 0, 1, sizeof(int8_t), 0, 0, 0, 0);
         }
 
         if constexpr (NEED_DEQUANT) {
@@ -1658,6 +1662,7 @@ public:
         n_loop = tilingdata.nLoop;
         core_loop = tilingdata.coreLoop;
         swizzle_cnt = tilingdata.swizzleCount;
+        swizzle_direct = tilingdata.swizzleDirect;
         en_shuffle_k = tilingdata.enShuffleK;
         core_num = tilingdata.blockDim;
         load_all_Amat_flag = tilingdata.enLoadAllAmat;
@@ -1781,7 +1786,11 @@ private:
     __aicore__ __force_inline__ void GetBaseBlockIdx(uint64_t index, uint64_t &m_idx, uint64_t &n_idx)
     {
         uint64_t in_batch_idx = index % (m_loop * n_loop);
-        if constexpr (swizzleDir == 0) {  // Zn
+        // Use the tiling-selected swizzle direction so that the Cube tile
+        // traversal order matches the Vector side, which reads the same
+        // field from tiling data at runtime. A mismatch breaks Cube/Vector
+        // tile pairing once m_loop > 1 (e.g. tokens > 256).
+        if (swizzle_direct == 0) {  // Zn
             uint64_t tile_block_loop = (m_loop + swizzle_cnt - 1) / swizzle_cnt;
             uint64_t tile_block_idx = in_batch_idx / (swizzle_cnt * n_loop);
             uint64_t in_tile_block_idx = in_batch_idx % (swizzle_cnt * n_loop);
@@ -1840,6 +1849,7 @@ private:
     uint32_t core_idx{0};
     uint32_t ping_flag{0};
     uint32_t swizzle_cnt{1};
+    uint32_t swizzle_direct{swizzleDir};
     uint32_t en_shuffle_k{0};
     uint32_t MM1_MM2_mode{0};
     uint64_t b0mat_pingpong_buffer_len{0};
@@ -2465,8 +2475,9 @@ template <typename InDtype, int8_t CACHE_MODE, DataFormat weightFormat1 = DataFo
 class MLAOperation
 {
     static_assert(!DirectOutput || (CACHE_MODE == CACHE_MODE_KROPE_CTKV &&
-                  quantMode == QuantMode::PER_TENSOR_ASYMM_QUANT),
-                  "Direct KV output supports only the BF16 W8A8 separate-output path");
+                                    (quantMode == QuantMode::PER_TENSOR_ASYMM_QUANT ||
+                                     quantMode == QuantMode::PER_TOKEN_SYMM_QUANT)),
+                  "Direct output shares the original BF16 quantized computation");
     static constexpr bool mm1WithSyncAll = (quantMode == QuantMode::PER_TOKEN_SYMM_QUANT);
     static constexpr uint64_t splitGapC = CACHE_MODE == CACHE_MODE_KVCACHE ? CONST_64 : CONST_0;
     using Q_OUT_DTYPE = typename std::conditional_t<CACHE_MODE == CACHE_MODE_INT8_NZCACHE, int8_t, InDtype>;
@@ -2526,10 +2537,8 @@ public:
         cos1GmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(cos1Gm));
         keycacheGmTensor1.SetGlobalBuffer(reinterpret_cast<__gm__ K_NOPE_DTYPE *>(keycacheOutGm));
         keycacheGmTensor2.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(keycacheOutGm2));
-        if constexpr (!DirectOutput) {
-            slotMappingGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(slotMappingGm));
-        } else if (mlaParams.writebackCapacity != 0) {
-            writebackSlotsGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(slotMappingGm));
+        slotMappingGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(slotMappingGm));
+        if (DirectOutput && mlaParams.writebackCapacity != 0) {
             writebackKGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(mlaParams.writebackKBase));
             writebackRopeGmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(mlaParams.writebackRopeBase));
         }
@@ -2676,8 +2685,10 @@ private:
             deScaleTensor = calTensor.ReinterpretCast<float>()[splitSizeOne_ * 2];
             AscendC::DataCopy(deScaleTensor, descale1gmTensor, AscendC::DataCopyParams(1, splitSizeOne_ / 8, 0, 0));
         }
-        SET_FLAG(MTE2, V, EVENT_ID2);
-        WAIT_FLAG(MTE2, V, EVENT_ID2);
+        if constexpr (!DirectOutput || quantMode == QuantMode::PER_TOKEN_SYMM_QUANT) {
+            SET_FLAG(MTE2, V, EVENT_ID2);
+            WAIT_FLAG(MTE2, V, EVENT_ID2);
+        }
         if constexpr (!DirectOutput) {
             SET_FLAG(MTE2, S, EVENT_ID2);
             WAIT_FLAG(MTE2, S, EVENT_ID2);
@@ -2711,12 +2722,13 @@ private:
             uint64_t cacheStart2 = 0;
             int64_t writebackSlot = -1;
             if constexpr (DirectOutput) {
-                // Current input order, with no slot read, page division or modulo.
+                // NPU current-KV outputs follow input order without paged-cache addressing.
                 const uint64_t token = static_cast<uint64_t>(vectorBlockIdx) * row_work + loop;
                 cacheStart1 = token * splitRmsNormSizeOne_;
                 cacheStart2 = token * splitRmsNormSizeTwo_;
                 if (mlaParams.writebackCapacity != 0) {
-                    writebackSlot = static_cast<int64_t>(writebackSlotsGmTensor.GetValue(token));
+                    // CPU writeback still uses the business slot to select the destination row.
+                    writebackSlot = static_cast<int64_t>(slotMappingGmTensor.GetValue(token));
                 }
             } else {
                 cacheStart = GetCacheOffset(cacheSlot, splitSizeOne_, kv_cache_stride0_);
@@ -2873,7 +2885,7 @@ private:
             if constexpr (DirectOutput) {
                 if (writebackSlot >= 0 && static_cast<uint64_t>(writebackSlot) < mlaParams.writebackCapacity) {
                     // Write the same final BF16 values; invalid business slots still
-                    // retain the NPU current-KV output used by paired_scatter.
+                    // retain the NPU current-KV output used by current-KV scatter.
                     const uint64_t slot = static_cast<uint64_t>(writebackSlot);
                     DataCopyPad(writebackKGmTensor[slot * splitRmsNormSizeOne_], outTmpTensor,
                                 AscendC::DataCopyExtParams(1, splitRmsNormSizeOne_ * sizeof(InDtype), 0, 0, 0));
@@ -2933,7 +2945,6 @@ private:
     AscendC::GlobalTensor<K_NOPE_DTYPE> keycacheGmTensor1;
     AscendC::GlobalTensor<InDtype> keycacheGmTensor2;
     AscendC::GlobalTensor<int32_t> slotMappingGmTensor;
-    AscendC::GlobalTensor<int32_t> writebackSlotsGmTensor;
     AscendC::GlobalTensor<InDtype> writebackKGmTensor;
     AscendC::GlobalTensor<InDtype> writebackRopeGmTensor;
     AscendC::GlobalTensor<int8_t> wuqGmTensor;
@@ -2967,8 +2978,7 @@ private:
 
     Quant<InDtype, true, false, quantMode, false> Quant1;
 
-    RmsNormQuant<InDtype, true, false, quantMode,
-                 quantMode == QuantMode::PER_TOKEN_SYMM_QUANT> rmsNormQuant2;
+    RmsNormQuant<InDtype, true, false, quantMode, quantMode == QuantMode::PER_TOKEN_SYMM_QUANT> rmsNormQuant2;
     RopeFp16<InDtype, InDtype, Q_OUT_DTYPE, CACHE_MODE> ropeFp16;
     EinSumQuant<InDtype, InDtype> einSumQuant;
 #endif
