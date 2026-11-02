@@ -187,9 +187,15 @@ class ACLGraphWrapper:
                 from vllm.model_executor.offloader.base import get_offloader
 
                 get_offloader().sync_prev_onload()
+                capture_context = torch.npu.graph(aclgraph, pool=self.graph_pool)
+                if hasattr(torch.ops._C_ascend, "mla_preprocess_prepare_tiling"):
+                    # Preserve Torch-NPU's chosen capture stream and graph pool.
+                    # Only prepare immutable tiling; do not run another forward.
+                    with torch.npu.stream(capture_context.capture_stream):
+                        torch.ops._C_ascend.mla_preprocess_prepare_tiling()
                 forward_context.capturing = True
                 try:
-                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                    with capture_context:
                         # `output` is managed by pytorch's aclgraph pool
                         output = self.runnable(*args, **kwargs)
                         # Join offloader's copy stream after forward to avoid
