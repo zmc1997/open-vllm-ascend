@@ -174,6 +174,7 @@ class AscendConfig:
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
         self.enable_sleep_mode_extra_cleanup = additional_config.get("enable_sleep_mode_extra_cleanup", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
+        self.multistream_sfa_indexer_overlap = additional_config.get("multistream_sfa_indexer_overlap", False)
         self.mtp_metadata_overlap = additional_config.get("mtp_metadata_overlap", False)
         self.enable_oproj_triton_quant = additional_config.get("enable_oproj_triton_quant", False)
         if not isinstance(self.enable_oproj_triton_quant, bool):
