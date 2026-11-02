@@ -114,6 +114,10 @@ struct MlaTilingData {
     uint64_t kvCacheBlockSize{128};
     uint64_t kvCacheStride0{0};
     uint64_t kvCacheRopeStride0{0};
+    // Direct-output only: registered CPU GVA pools; slots remain a dynamic input.
+    uint64_t writebackKBase{0};
+    uint64_t writebackRopeBase{0};
+    uint64_t writebackCapacity{0};
 };
 
 #endif  // MLAPREPROCESS_TILING_H

@@ -166,6 +166,37 @@ Add the following options to the Decode launch command:
 | `topk_buffer_size` | Device hot-buffer size. It must be at least `index_topk` and divisible by `block_size`. Twice `index_topk` is a practical starting point. |
 | `dram_size_per_dp_GB` | Host memory reserved per DP rank. It must hold the full KV cache. TP ranks share this pool. |
 | `keep_device_kv_cache` | Debug-only option that retains the full device KV cache. Keep it `false` in production. |
+| `store_port_base` | Local shared CPU KV store base port. Defaults to 8500; each DP rank adds its index. Use disjoint port ranges for services sharing a host. |
+
+### Direct MLAPO with fused-overlap offload
+
+Direct MLAPO supports disaggregated Decode/MTP with BF16 activations and
+static W8A8 QKV/Q projections. It produces current-token KV and fuses CPU
+writeback on TP0, avoiding a separate copy.
+
+Merge these fields into the existing Decode `--additional-config`:
+
+```json
+{
+    "enable_mlapo": true,
+    "sparse_kv_offload_config": {
+        "enabled": true,
+        "use_fused_overlap": true,
+        "keep_device_kv_cache": false
+    }
+}
+```
+
+- **Path selection**: The default Copy-SFA path, configurations that do not
+  meet Direct's enablement conditions, and steps exceeding 1024 tokens use
+  Native preprocessing. Invalid tensor shapes or layouts still raise errors.
+- **Computation and dimensions**: The constraints are unchanged from the
+  original MLAPO operator. A KV LoRA rank other than 512 or a RoPE dimension
+  other than 64 triggers only a warning and requires numerical validation.
+  Bitwise equality with Native is not guaranteed.
+- **Build and validation**: Rebuild and install the ACLNN operator package
+  and PyTorch extension together. Validate numerical correctness, graph
+  replay, and multi-TP CPU writeback before deployment.
 
 ## 4. Use Them Together
 

@@ -251,7 +251,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
                 get_num_layers=MagicMock(return_value=1),
                 max_model_len=128,
             ),
-            parallel_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(data_parallel_index=3),
             scheduler_config=SimpleNamespace(
                 max_num_seqs=1,
                 max_num_batched_tokens=1,
@@ -334,6 +334,8 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
                 )
                 self.assertEqual(initialized_config.world_size, 2)
                 self.assertEqual(initialized_config.rank_id, rank)
+                self.assertEqual(initialized_config.scene, "shared")
+                self.assertEqual(initialized_config.store_url, "tcp://127.0.0.1:8503")
                 tp_group.barrier.assert_called_once_with()
 
     def test_manager_rejects_pool_larger_than_dram_limit(self):
@@ -383,3 +385,103 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHostKVRegistration(unittest.TestCase):
+    @staticmethod
+    def _make_fused_overlap_manager():
+        manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+        manager.tp_rank = 0
+        manager.num_layers = 1
+        manager.offload_layer_names = ["layer.0"]
+        manager.kv_cache_config = SimpleNamespace(num_blocks=3)
+        manager.topk_buffer_size = 256
+        manager.topk = 256
+        manager.block_size = 128
+        manager.max_num_tokens = 2
+        manager.max_num_topk_rows = 2
+        manager.use_fused_copy_sfa = False
+        manager.use_fused_overlap = True
+        manager._register_offload_layers = MagicMock()
+        manager.max_model_len = 128
+        manager._warmup_external_lru_planner_threads = MagicMock()
+        manager._initialize_fused_writeback_descriptors = MagicMock()
+        manager._initialize_paired_current_scatter = MagicMock()
+        manager.tp_group = SimpleNamespace(broadcast=MagicMock())
+        return manager
+
+    @staticmethod
+    def _make_fused_overlap_cache(num_blocks=3):
+        torch = manager_module.torch
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty((num_blocks, 128, 1, 4), dtype=torch.bfloat16),
+            torch.empty((num_blocks, 128, 1, 2), dtype=torch.bfloat16),
+            torch.empty((2, 256, 1, 4), dtype=torch.bfloat16),
+            torch.empty((2, 256, 1, 2), dtype=torch.bfloat16),
+        )
+
+    def test_fused_overlap_registers_replacement_cpu_pools(self):
+        torch = manager_module.torch
+        manager = self._make_fused_overlap_manager()
+        originals = {name: getattr(torch, name) for name in ("zeros", "empty", "full", "arange", "tensor")}
+
+        def cpu_factory(original):
+            def allocate(*args, **kwargs):
+                kwargs["device"] = "cpu"
+                kwargs.pop("pin_memory", None)
+                return original(*args, **kwargs)
+
+            return allocate
+
+        with (
+            patch.object(torch, "zeros", side_effect=cpu_factory(originals["zeros"])),
+            patch.object(torch, "empty", side_effect=cpu_factory(originals["empty"])),
+            patch.object(torch, "full", side_effect=cpu_factory(originals["full"])),
+            patch.object(torch, "arange", side_effect=cpu_factory(originals["arange"])),
+            patch.object(torch, "tensor", side_effect=cpu_factory(originals["tensor"])),
+            patch.object(torch.Tensor, "pin_memory", lambda value: value),
+            patch.object(manager_module.torch_npu.npu, "Stream") as stream,
+        ):
+            for num_blocks in (3, 5):
+                with self.subTest(num_blocks=num_blocks):
+                    manager.kv_cache_config.num_blocks = num_blocks
+                    cache = self._make_fused_overlap_cache(num_blocks)
+                    manager.register_kv_caches({"layer.0": cache})
+                    self.assertIs(manager.k_caches_cpu[0], cache[2])
+                    self.assertIs(manager.v_caches_cpu[0], cache[3])
+                    self.assertEqual(manager.gvas_k_bases, [cache[2].data_ptr()])
+                    self.assertEqual(manager.gvas_v_bases, [cache[3].data_ptr()])
+                    self.assertEqual(manager.k_caches_cpu[0].numel() // 4, num_blocks * 128)
+                    self.assertEqual(manager.v_caches_cpu[0].numel() // 2, num_blocks * 128)
+                    self.assertEqual(manager.cpu_block_lens, [(1024, 512)])
+
+        self.assertEqual(stream.call_count, 4)
+        self.assertEqual(manager._warmup_external_lru_planner_threads.call_count, 2)
+
+    def test_fused_overlap_rejects_invalid_cpu_pools_before_startup(self):
+        torch = manager_module.torch
+        invalid_pools = {
+            "non_cpu": lambda pool: torch.empty_like(pool, device="meta"),
+            "dtype": lambda pool: pool.to(torch.float16),
+            "noncontiguous": lambda pool: pool.transpose(0, 1),
+            "partial_row": lambda pool: torch.empty(pool.numel() + 1, dtype=pool.dtype),
+            "zero_capacity": lambda pool: pool[:0],
+            "unequal_capacity": lambda pool: pool[:2],
+            "missing": lambda pool: None,
+        }
+        for pool_index in (2, 3):
+            for reason, invalidate in invalid_pools.items():
+                with self.subTest(pool_index=pool_index, reason=reason):
+                    manager = self._make_fused_overlap_manager()
+                    cache = list(self._make_fused_overlap_cache())
+                    cache[pool_index] = invalidate(cache[pool_index])
+                    with (
+                        patch.object(manager_module.torch_npu.npu, "Stream") as stream,
+                        self.assertRaises(ValueError),
+                    ):
+                        manager.register_kv_caches({"layer.0": tuple(cache)})
+                    stream.assert_not_called()
+                    manager._warmup_external_lru_planner_threads.assert_not_called()
+                    manager.tp_group.broadcast.assert_not_called()

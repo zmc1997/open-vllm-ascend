@@ -1045,6 +1045,7 @@ class SparseKVOffloadConfig:
 
         self.topk_buffer_size = int(user_config.get("topk_buffer_size", 4096))
         self.dram_size_per_dp_GB = int(user_config.get("dram_size_per_dp_GB", 128))
+        self.store_port_base = int(user_config.get("store_port_base", 8500))
         self.keep_device_kv_cache = bool(user_config.get("keep_device_kv_cache", False))
         self.use_fused_overlap = bool(user_config.get("use_fused_overlap", False))
 
@@ -1053,6 +1054,8 @@ class SparseKVOffloadConfig:
         if not hasattr(vllm_config.model_config.hf_text_config, "index_topk"):
             raise ValueError("Sparse KV offload only support sparse attention model.")
         parallel_config = vllm_config.parallel_config
+        if not 0 < self.store_port_base <= 65535 - parallel_config.data_parallel_index:
+            raise ValueError("sparse_kv_offload_config.store_port_base plus the DP index must be a valid TCP port")
         if parallel_config.prefill_context_parallel_size * parallel_config.decode_context_parallel_size > 1:
             raise ValueError("Sparse KV offload don't support context parallel now.")
         if parallel_config.pipeline_parallel_size > 1:
