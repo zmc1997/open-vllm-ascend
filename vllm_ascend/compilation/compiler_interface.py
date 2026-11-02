@@ -245,6 +245,8 @@ class AscendCompiler(CompilerInterface):
             "enable_npugraph_ex": ascend_compilation_config.enable_npugraph_ex,
             "enable_static_kernel": ascend_compilation_config.enable_static_kernel,
         }
+        if get_ascend_config().multistream_sfa_indexer_overlap:
+            factors["sfa_indexer_overlap_stage"] = "mlapo_k_before_producer_single_q_handoff_v2"
         logger.info("AscendCompiler hash factors: %s", factors)
         return sha256(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]
 
