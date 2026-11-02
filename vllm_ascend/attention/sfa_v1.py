@@ -1211,6 +1211,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._vup_triton_bmm = vup_bmm
 
     def _v_up_proj(self, x):
+        prefetch_plan = getattr(self, "_o_proj_weight_prefetch", None)
+        if prefetch_plan is not None:
+            prefetch_plan.submit(x)
         if self._vup_triton_bmm is not None:
             heads, rank, width = self.W_UV.shape
             x = x.view(-1, heads, rank)

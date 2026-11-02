@@ -78,11 +78,8 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        # Bound o_proj plans start here, after V-up, to overlap only input
-        # quantization instead of competing with V-up's weight reads.
+        # SFA submits the bound plan before V-up; join after input quantization.
         prefetch_plan = getattr(layer, "_o_proj_weight_prefetch", None)
-        if prefetch_plan is not None:
-            prefetch_plan.submit(x)
         if x.dtype != torch.int8:
             triton_quant = getattr(layer, "_static_triton_quant", None)
             if triton_quant is not None:

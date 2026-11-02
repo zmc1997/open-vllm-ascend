@@ -82,7 +82,7 @@ class DirectWeightPrefetchPlan:
         if not self._can_submit(dependency):
             return
         # Wait only for the producer stream's work up to this point:
-        # shared-expert down for Direct or V-up output for o_proj. A Direct plan
+        # shared-expert down for Direct or FSA output for o_proj. A Direct plan
         # must not join the main stream, which would also wait for Combine.
         self.producer_ready.record(torch_npu.npu.current_stream())
         with torch_npu.npu.stream(self.stream):
@@ -104,7 +104,7 @@ class DirectWeightPrefetchPlan:
 
 
 class OProjWeightPrefetchPlan(DirectWeightPrefetchPlan):
-    """Single-weight V-up -> input quantization -> static W8A8 o_proj plan."""
+    """Single-weight FSA output -> V-up/quantization -> static W8A8 o_proj plan."""
 
     def _can_submit(self, dependency: torch.Tensor) -> bool:
         # Fused matmul/reduce-scatter bypasses the static linear scheme's

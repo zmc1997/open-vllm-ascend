@@ -256,8 +256,8 @@ class AscendCompiler(CompilerInterface):
                 prefetch_config.mtp_rot_max_prefetch_bytes,
             )
             if prefetch_config.o_proj_max_prefetch_bytes > 0:
-                # Distinguish the former pre-V-up schedule in cached graphs.
-                factors["o_proj_prefetch_stage"] = "before_input_quantization_v1"
+                # Distinguish the former input-quantization schedule in cached graphs.
+                factors["o_proj_prefetch_stage"] = "before_v_up_projection_v2"
             if prefetch_config.mtp_rot_max_prefetch_bytes > 0:
                 factors["mtp_rot_prefetch_stage"] = "draft_logits_before_sampling_eager_v1"
         logger.info("AscendCompiler hash factors: %s", factors)

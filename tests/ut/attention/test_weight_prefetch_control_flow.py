@@ -145,7 +145,7 @@ class TestWeightPrefetchControlFlow(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_oproj_hook_wraps_cann_and_triton_quantization(self):
-        for use_triton in (False, True):
+        for use_triton, use_triton_bmm in ((False, False), (False, True), (True, False), (True, True)):
             ns, _, aux, calls = self._plans()
             plan = ns["OProjWeightPrefetchPlan"](self._tensor(calls), "layer", aux, 1024)
             result = object()
@@ -180,9 +180,32 @@ class TestWeightPrefetchControlFlow(unittest.TestCase):
                 quant_bias=object(),
                 params_dtype="bf16",
             )
-            self.assertIs(apply(None, layer, self._tensor(calls)), result)
+            x = self._tensor(calls)
+            x.view = lambda *_args, x=x: x
+            x.reshape = lambda *_args, x=x: x
+
+            def bmm(*_args, calls=calls, x=x, **_kwargs):
+                calls.append(("vup_bmm",))
+                return x
+
+            sfa = SimpleNamespace(
+                _o_proj_weight_prefetch=plan,
+                _vup_triton_bmm=bmm if use_triton_bmm else None,
+                W_UV=SimpleNamespace(shape=(1, 128, 128)),
+                local_num_heads=1,
+                kv_lora_rank=128,
+                v_head_dim=128,
+            )
+            v_up = _load(
+                "vllm_ascend/attention/sfa_v1.py",
+                {"_v_up_proj"},
+                {"torch_npu": SimpleNamespace(npu_transpose_batchmatmul=bmm)},
+            )["_v_up_proj"]
+            self.assertIs(apply(None, layer, v_up(sfa, x)), result)
             stages = [call[0] for call in calls]
-            self.assertLess(stages.index("prefetch"), stages.index("quantize"))
+            self.assertEqual(stages.count("prefetch"), 1)
+            self.assertLess(stages.index("prefetch"), stages.index("vup_bmm"))
+            self.assertLess(stages.index("vup_bmm"), stages.index("quantize"))
             self.assertLess(stages.index("quantize"), stages.index("wait_main"))
             self.assertLess(stages.index("wait_main"), stages.index("matmul"))
 
