@@ -95,14 +95,13 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
         if ascend_quant_method == COMPRESSED_TENSORS_METHOD:
             quant_bias = bias
 
-        output = torch_npu.npu_quant_matmul(
+        return torch_npu.npu_quant_matmul(
             x,
             layer.weight,
             layer.deq_scale,
             bias=quant_bias,
             output_dtype=layer.params_dtype,
         )
-        return output
 
     def process_weights_after_loading(self, layer):
         expanding_factor = layer.weight.data.shape[1]
