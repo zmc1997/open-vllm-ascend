@@ -63,6 +63,67 @@ def test_fused_metadata_checks_do_not_change_mtp_flattening(enabled):
     torch.testing.assert_close(observed[2], blocks[torch.tensor([0, 0, 1, 1])])
 
 
+@pytest.mark.parametrize(("initial_q_lens", "width"), [((6,), 8192), ((2, 4), 257)])
+def test_fused_overlap_metadata_npu_eager_and_replay(initial_q_lens, width):
+    from vllm.triton_utils import HAS_TRITON
+
+    if not HAS_TRITON or not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("requires an NPU with Triton")
+
+    num_reqs = len(initial_q_lens)
+    num_tokens = sum(initial_q_lens)
+    initial_lens = torch.tensor(initial_q_lens, dtype=torch.int32)
+    cumulative = initial_lens.cumsum(0, dtype=torch.int32).npu()
+    kv_lens = torch.tensor([1024000 + 128 * i for i in range(num_reqs)], dtype=torch.int32).npu()
+    req_ids = torch.arange(num_reqs, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        token_to_req=req_ids.repeat_interleave(initial_lens).npu(),
+        req_ids_tensor=req_ids.to(torch.int64).npu(),
+        block_table=torch.arange(num_reqs * width, dtype=torch.int32).reshape(num_reqs, width).npu(),
+    )
+    topk = torch.zeros((num_tokens, 1, 1), dtype=torch.int32, device=cumulative.device)
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+
+    def prepare(context):
+        with patch("vllm_ascend.attention.sfa_kv_offload.get_forward_context", return_value=context):
+            return impl._prepare_fused_overlap_decode_common_inputs(
+                metadata,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                topk_indices_decode=topk,
+                actual_seq_lengths_query_decode=cumulative,
+                actual_seq_lengths_key_decode=kv_lens,
+            )
+
+    def reference():
+        with patch("vllm_ascend.attention.sfa_kv_offload.envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA", True):
+            return prepare(SimpleNamespace(capturing=False))
+
+    def check(actual, expected):
+        for new, old in zip(actual, expected, strict=True):
+            assert new.shape == old.shape and new.dtype == old.dtype and new.stride() == old.stride()
+            assert torch.equal(new.cpu(), old.cpu())
+
+    expected = reference()
+    with patch("vllm_ascend.attention.sfa_kv_offload.envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA", False):
+        context = SimpleNamespace(capturing=False)
+        eager = prepare(context)
+        assert prepare(context) is eager
+        check(eager, expected)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            replayed = prepare(SimpleNamespace(capturing=True))
+
+    # Keep captured addresses and change their live metadata in place.
+    new_lens = initial_lens.flip(0)
+    cumulative.copy_(new_lens.cumsum(0, dtype=torch.int32).npu())
+    metadata.token_to_req.copy_(req_ids.repeat_interleave(new_lens).npu())
+    kv_lens.add_(1)
+    metadata.block_table.add_(1)
+    graph.replay()
+    check(replayed, reference())
+
+
 def test_disabling_device_checks_preserves_shape_validation_without_item():
     impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
     metadata = SimpleNamespace(token_to_req=torch.tensor([0, 0], dtype=torch.int32))

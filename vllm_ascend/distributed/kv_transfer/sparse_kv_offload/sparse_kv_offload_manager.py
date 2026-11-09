@@ -1,4 +1,5 @@
 import contextlib
+import ctypes
 import os
 import typing
 from dataclasses import dataclass
@@ -444,6 +445,9 @@ class SparseKVOffloadManager:
     No more scheduling logic: we reuse the original block_table/slot_mapping.
     """
 
+    _fused_device_plan_library: ctypes.CDLL | None = None
+    fused_overlap_membership_device = torch.device("cpu")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -686,14 +690,22 @@ class SparseKVOffloadManager:
             return self.fused_overlap_membership_map
 
         shape = [row_capacity, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT]
-        owner_ptr = torch.zeros(1, dtype=torch.int64, device="npu")
+        owner_ptr = None
         membership_map = None
-        if self.tp_rank == 0:
-            membership_map = offload.empty(
-                [row_capacity * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
-                dtype=torch.int16,
-                pin_memory=True,
-            ).view(shape)
+        if self._fused_device_plan_library is not None:
+            if row_capacity != self.max_num_topk_rows:
+                raise ValueError(f"Device FSA membership requires {self.max_num_topk_rows} rows, got {row_capacity}")
+            membership_map = torch.empty(shape, dtype=torch.int16, device=self.fused_overlap_membership_device)
+        else:
+            owner_ptr = torch.zeros(1, dtype=torch.int64, device="npu")
+            if self.tp_rank == 0:
+                membership_map = offload.empty(
+                    [row_capacity * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
+                    dtype=torch.int16,
+                    pin_memory=True,
+                ).view(shape)
+
+        if membership_map is not None:
             membership_map.fill_(-1)
             control = membership_map[
                 :,
@@ -704,14 +716,17 @@ class SparseKVOffloadManager:
             control[:, 2] = self.topk
             control[:, 3] = FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT - self.topk
             control[:, 7] = FSA_PAIRED_SELECTION_COPY_MARKER
-            owner_ptr[0] = membership_map.data_ptr()
-        self.tp_group.broadcast(owner_ptr, src=0)
-        shared_ptr = int(owner_ptr.item())
-        if self.tp_rank != 0:
-            membership_map = self._restore_int16_tensor(shared_ptr, shape)
+            if owner_ptr is not None:
+                owner_ptr[0] = membership_map.data_ptr()
+        if owner_ptr is not None:
+            self.tp_group.broadcast(owner_ptr, src=0)
+            shared_ptr = int(owner_ptr.item())
+            if self.tp_rank != 0:
+                membership_map = self._restore_int16_tensor(shared_ptr, shape)
         if membership_map is None:
             raise RuntimeError("mapped membership storage was not initialized")
-        self.tp_group.barrier()
+        if owner_ptr is not None:
+            self.tp_group.barrier()
         self.fused_overlap_membership_map = membership_map
         self.fused_overlap_membership_map_rows = row_capacity
         return membership_map
@@ -742,6 +757,8 @@ class SparseKVOffloadManager:
         self,
         kv_caches: dict[str, torch.Tensor],
     ):
+        if self._fused_device_plan_library is not None:
+            raise RuntimeError("Device FSA KV re-registration requires a new manager and new captures")
         self._register_offload_layers(kv_caches)
 
         # register topk_buffer and cpu kv_cache
@@ -830,6 +847,7 @@ class SparseKVOffloadManager:
             self.fused_plan_current_linear_slots_npu = self.fused_plan_metadata_npu[1:]
             self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
             self.producer_writeback_layers: set[int] = set()
+            self._init_fused_device_planner(device)
         self.d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
         self.d2h_token_indices_npu = torch.arange(self.max_num_tokens, dtype=torch.int64, device=device)
 
@@ -1119,6 +1137,62 @@ class SparseKVOffloadManager:
         self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
         self.lru_physical_row_workspace_ptr = self.lru_physical_row_workspace.data_ptr()
+
+    def _init_fused_device_planner(self, device: torch.device) -> None:
+        library_path = envs.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY
+        if not library_path:
+            return
+        geometry = (self.topk, self.topk_buffer_size, self.max_num_topk_rows, self.max_model_len)
+        if geometry != (2048, 4096, 32, 1 << 20):
+            raise ValueError(
+                "Device FSA planner requires TopK/capacity/rows/max length "
+                f"(2048, 4096, 32, 1048576), got {geometry}"
+            )
+        if not self.fused_async_plan or self.vllm_config.parallel_config.enable_dbo or self.tp_size not in (1, 2):
+            raise ValueError("Device FSA planner requires async planning, DBO disabled, and TP size 1 or 2")
+        if not os.path.isabs(library_path):
+            raise ValueError("VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY must be an absolute path")
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+        if get_ascend_device_type() != AscendDeviceType.A3:
+            raise ValueError("Device FSA planner requires Ascend A3")
+        library = ctypes.CDLL(library_path)
+        library.fsa_lru_plan_async.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_uint32, ctypes.c_void_p]
+        library.fsa_lru_plan_async.restype = ctypes.c_int
+        library.fsa_lru_publish_async.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32, ctypes.c_void_p]
+        library.fsa_lru_publish_async.restype = ctypes.c_int
+        rows = self.max_num_topk_rows
+        self.fused_overlap_membership_device = device
+        self.fused_device_planner_payload = torch.empty((rows, 1040), dtype=torch.int32, device=device)
+        if self.tp_rank == 0:
+            self.fused_device_planner_mapping = torch.empty(4 * rows, dtype=torch.int32, device=device)
+            self.fused_device_planner_input_staging = (
+                torch.empty(rows, dtype=torch.int64, device=device),
+                torch.empty((rows, self.topk), dtype=torch.int32, device=device),
+                torch.empty(rows, dtype=torch.int32, device=device),
+                torch.empty(rows, dtype=torch.int32, device=device),
+            )
+            self.fused_device_planner_layer_states: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._fused_device_plan_library = library
+
+    def _get_fused_device_planner_layer_state(
+        self, layer_id: int, capturing: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        state = self.fused_device_planner_layer_states.get(layer_id)
+        if state is None:
+            if capturing:
+                raise RuntimeError(f"Device FSA planner owner layer {layer_id} was not initialized before capture")
+            device = self.fused_overlap_membership_device
+            rows = self.max_num_topk_rows
+            capacity = self.topk_buffer_size
+            last_req_ids = torch.full((rows,), -1, dtype=torch.int64, device=device)
+            banks = torch.zeros((rows,), dtype=torch.int32, device=device)
+            physical_state = torch.full((rows, 4, capacity), -1, dtype=torch.int32, device=device)
+            identity = torch.arange(capacity, dtype=torch.int32, device=device)
+            physical_state[:, 1:3].copy_(identity)
+            state = last_req_ids, banks, physical_state
+            self.fused_device_planner_layer_states[layer_id] = state
+        return state
 
     def _initialize_paired_current_scatter(self) -> None:
         self.fused_current_scatter = None
@@ -1627,21 +1701,68 @@ class SparseKVOffloadManager:
                 )
 
         if async_plan:
+            device_planner = self._fused_device_plan_library
+            if device_planner is not None and self.tp_rank == 0:
+                inputs = (req_ids_npu, topk_indices_npu, stable_prefix_lens_npu, visible_seq_lens_npu)
+                if any(
+                    tensor.device != staging.device or tensor.dtype != staging.dtype
+                    for tensor, staging in zip(inputs, self.fused_device_planner_input_staging)
+                ):
+                    raise ValueError(
+                        "Device FSA planner requires int64 request IDs and int32 TopK/lengths on the local NPU"
+                    )
+                layer_state = self._get_fused_device_planner_layer_state(layer_id, capturing)
+                device_inputs = []
+                for index, (tensor, staging) in enumerate(zip(inputs, self.fused_device_planner_input_staging)):
+                    if not tensor.is_contiguous() or (index == 1 and tensor.data_ptr() % 32):
+                        # The manager keeps these raw-kernel addresses alive across graph replays.
+                        target = staging[:num_tokens]
+                        target.copy_(tensor)
+                        tensor = target
+                    device_inputs.append(tensor)
+                if not capturing:
+                    for tensor in device_inputs:
+                        tensor.record_stream(self.fused_plan_stream)
             plan_inputs_ready = torch_npu.npu.current_stream().record_event()
             with torch_npu.npu.stream(self.fused_plan_stream):
                 self.fused_plan_stream.wait_event(plan_inputs_ready)
                 if self.tp_rank == 0:
-                    copy_inputs(non_blocking=True)
-                    run_planner(enqueue=True)
-                    self.fused_plan_current_linear_slots_npu[:num_tokens].copy_(
-                        self.lru_physical_row_workspace[
-                            self.max_num_topk_rows * 2 : self.max_num_topk_rows * 2 + num_tokens
-                        ],
-                        non_blocking=True,
-                    )
+                    if device_planner is None:
+                        copy_inputs(non_blocking=True)
+                        run_planner(enqueue=True)
+                        self.fused_plan_current_linear_slots_npu[:num_tokens].copy_(
+                            self.lru_physical_row_workspace[
+                                self.max_num_topk_rows * 2 : self.max_num_topk_rows * 2 + num_tokens
+                            ],
+                            non_blocking=True,
+                        )
+                    else:
+                        pointers = tuple(tensor.data_ptr() for tensor in (*device_inputs, *layer_state))
+                        result = device_planner.fsa_lru_plan_async(
+                            *pointers,
+                            self.fused_device_planner_mapping.data_ptr(),
+                            self.fused_device_planner_payload.data_ptr(),
+                            num_tokens,
+                            self.fused_plan_stream.npu_stream,
+                        )
+                        if result != 0:
+                            raise RuntimeError(f"Device FSA planner launch failed for {layer_name}, status {result}")
                     if capturing and self.tp_size > 1:
                         self.fused_plan_stream.wait_stream(self.current_kv_save_stream)
-                self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+                if device_planner is None:
+                    self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+                else:
+                    payload = self.fused_device_planner_payload
+                    self.tp_group.broadcast(payload[:num_tokens], src=0)
+                    result = device_planner.fsa_lru_publish_async(
+                        payload.data_ptr(),
+                        selection_membership_map.data_ptr(),
+                        self.fused_plan_metadata_npu.data_ptr(),
+                        num_tokens,
+                        self.fused_plan_stream.npu_stream,
+                    )
+                    if result != 0:
+                        raise RuntimeError(f"Device FSA plan publish failed for {layer_name}, status {result}")
             self.fused_overlap_plan_owner_layer_id = layer_id
             self.fused_overlap_plan_topk = self.topk
             self.fused_overlap_plan_num_tokens = num_tokens
@@ -1717,6 +1838,10 @@ class SparseKVOffloadManager:
                 f"expected=({num_tokens},), "
                 f"actual={tuple(visible_seq_lens_npu.shape)}"
             )
+        if self._fused_device_plan_library is not None:
+            if selection_membership_map is None or selection_membership_map is not self.fused_overlap_membership_map:
+                raise ValueError("Device FSA planner requires the manager-owned local membership map")
+            return
         if (
             selection_membership_map.dim() != 2
             or selection_membership_map.shape[0] < num_tokens

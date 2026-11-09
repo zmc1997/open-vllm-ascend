@@ -106,6 +106,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Non-sensitive FSA scheduling: 1 (default) enables the dynamic planner stream; 0 disables it.
     "VLLM_ASCEND_FSA_ASYNC_PLAN": lambda: bool(int(os.getenv("VLLM_ASCEND_FSA_ASYNC_PLAN", "1"))),
+    # Optional absolute path to the TEST267 fused-overlap device planner ABI.
+    "VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY": lambda: os.getenv("VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY"),
     # Non-sensitive FSA layout reuse within a graph capture: 1 (default); 0 disables it.
     "VLLM_ASCEND_FSA_REUSE_WRITEBACK_LAYOUT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FSA_REUSE_WRITEBACK_LAYOUT", "1"))

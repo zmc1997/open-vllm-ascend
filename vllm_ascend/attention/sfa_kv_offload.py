@@ -31,6 +31,7 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 from vllm.logger import logger
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend import envs as envs_ascend
@@ -651,6 +652,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         topk: int,
         cache_blocks_per_row: int,
         device: torch.device,
+        membership_device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         cache_token_capacity = max(self.max_num_topk_rows, token_count)
         cache_topk_head_capacity = max(topk_head_count, 1)
@@ -675,7 +677,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             or self._fused_overlap_selection_capacity[3] < cache_blocks_per_row
             or self.selection_kv_block_table.device != device
             or self.selection_kv_block_status.device != device
-            or self.selection_membership_map.device.type != "cpu"
+            or self.selection_membership_map.device != membership_device
             or self.fused_overlap_last_req_ids.device != device
         )
         if needs_realloc:
@@ -980,14 +982,24 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             full_kv_actual_seq=full_kv_actual_seq,
         )
         if num_tokens != num_reqs:
-            full_q_actual_seq, full_kv_actual_seq, full_kv_block_table = self._flatten_fused_overlap_mtp_to_token_batch(
-                attn_metadata,
-                num_tokens=num_tokens,
-                num_reqs=num_reqs,
-                full_q_actual_seq=full_q_actual_seq,
-                full_kv_actual_seq=full_kv_actual_seq,
-                full_kv_block_table=full_kv_block_table,
-            )
+            validate_device = not forward_context.capturing and envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA
+            if HAS_TRITON and device.type == "npu" and not validate_device:
+                from vllm_ascend.ops.triton.fsa_metadata import flatten_fused_overlap_metadata
+
+                full_q_actual_seq, full_kv_actual_seq, full_kv_block_table = flatten_fused_overlap_metadata(
+                    token_to_req, full_q_actual_seq, full_kv_actual_seq, full_kv_block_table
+                )
+            else:
+                full_q_actual_seq, full_kv_actual_seq, full_kv_block_table = (
+                    self._flatten_fused_overlap_mtp_to_token_batch(
+                        attn_metadata,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                        full_q_actual_seq=full_q_actual_seq,
+                        full_kv_actual_seq=full_kv_actual_seq,
+                        full_kv_block_table=full_kv_block_table,
+                    )
+                )
             if full_kv_block_table.size(0) != full_q_actual_seq.numel():
                 raise RuntimeError(
                     "fused_overlap native-TND block_table batch mismatch: "
@@ -1092,6 +1104,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             topk=topk,
             cache_blocks_per_row=cache_blocks_per_row,
             device=ql_nope_decode.device,
+            membership_device=getattr(manager, "fused_overlap_membership_device", torch.device("cpu")),
         )
         external_plan_prepared = manager.prepare_fused_overlap_external_plan(
             layer_name=layer_name,
