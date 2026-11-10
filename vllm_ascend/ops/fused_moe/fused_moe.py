@@ -943,6 +943,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 maybe_wait_event(fused_moe_evts.before_combine)
                 shared_out = self._shared_experts_part2(hidden_states, part1_out)
 
+            prefetch_plan = getattr(self, "_direct_weight_prefetch_out", None)
+            if prefetch_plan is not None:
+                prefetch_plan.submit(shared_out)
+
         # Make sure the default stream waits for the shared experts stream to
         # finish.
         if self.multistream_overlap_shared_expert:

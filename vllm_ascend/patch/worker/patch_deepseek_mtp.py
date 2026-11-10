@@ -45,6 +45,9 @@ class AscendDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
         inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
         inputs_embeds = self.enorm(inputs_embeds)
         if self.is_rot_used and self.target_model_type == "glm_moe_dsa":
+            rot_prefetch = getattr(self, "_mtp_rot_weight_prefetch", None)
+            if rot_prefetch is not None:
+                rot_prefetch.wait()
             previous_hidden_states = self.rot(previous_hidden_states)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 

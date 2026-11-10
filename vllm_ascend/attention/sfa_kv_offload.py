@@ -322,6 +322,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 "writeback_rope_base": v_cache_cpu.data_ptr(),
                 "writeback_capacity": capacity,
             }
+        prefetch_plan = getattr(self, "_direct_weight_prefetch_in", None)
+        if prefetch_plan is not None:
+            prefetch_plan.wait()
         torch.ops._C_ascend.mla_preprocess_with_kv_offload(
             hidden_states,
             self.wd_qkv,
