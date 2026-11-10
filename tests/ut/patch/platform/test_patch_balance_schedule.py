@@ -282,6 +282,12 @@ def _schedule_body_ast(source: str) -> str:
             return node
 
         def visit_If(self, node: ast.If):  # noqa: N802
+            if isinstance(node.test, ast.BoolOp) and ast.unparse(node.test.values[-1]) == (
+                "not (self.connector is not None and self.reset_preempted_req_ids)"
+            ):
+                node.test.values.pop()
+            if ast.unparse(node.test) == "ext_tokens == 0 and num_new_local_computed_tokens":
+                return None
             test = ast.dump(node.test)
             # delta 1: disabled-path early return.
             if "_balance_enabled" in test:

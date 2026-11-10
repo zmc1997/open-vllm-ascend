@@ -124,15 +124,25 @@ def test_fused_overlap_metadata_npu_eager_and_replay(initial_q_lens, width):
     check(replayed, reference())
 
 
-def test_disabling_device_checks_preserves_shape_validation_without_item():
+@pytest.mark.parametrize("capturing", [False, True])
+def test_fused_metadata_shape_checks_precede_index_select_without_item(capturing):
     impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
-    metadata = SimpleNamespace(token_to_req=torch.tensor([0, 0], dtype=torch.int32))
+    metadata = SimpleNamespace(
+        token_to_req=torch.tensor([0, 0, 0], dtype=torch.int32),
+        req_ids_tensor=torch.tensor([7]),
+        block_table=torch.tensor([[10, 11]], dtype=torch.int32),
+    )
     with (
         patch(
-            "vllm_ascend.attention.sfa_kv_offload.get_forward_context", return_value=SimpleNamespace(capturing=False)
+            "vllm_ascend.attention.sfa_kv_offload.get_forward_context",
+            return_value=SimpleNamespace(capturing=capturing),
         ),
-        patch("vllm_ascend.attention.sfa_kv_offload.envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA", False),
+        patch(
+            "vllm_ascend.attention.sfa_kv_offload.envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA",
+            capturing,
+        ),
         patch.object(torch.Tensor, "item", side_effect=AssertionError("unexpected device-value read")),
+        patch.object(torch, "index_select", side_effect=AssertionError("invalid metadata reached index_select")),
     ):
         impl._validate_fused_overlap_mtp_decode_metadata(
             metadata,
@@ -142,12 +152,13 @@ def test_disabling_device_checks_preserves_shape_validation_without_item():
             full_kv_actual_seq=torch.tensor([10]),
         )
         with pytest.raises(RuntimeError, match="token_to_req length mismatch"):
-            impl._validate_fused_overlap_mtp_decode_metadata(
+            impl._prepare_fused_overlap_decode_common_inputs(
                 metadata,
-                num_tokens=3,
+                num_tokens=4,
                 num_reqs=1,
-                full_q_actual_seq=torch.tensor([3]),
-                full_kv_actual_seq=torch.tensor([10]),
+                topk_indices_decode=torch.zeros((4, 1, 1), dtype=torch.int32),
+                actual_seq_lengths_query_decode=torch.tensor([4]),
+                actual_seq_lengths_key_decode=torch.tensor([10]),
             )
 
 

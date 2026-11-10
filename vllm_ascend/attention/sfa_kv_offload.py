@@ -801,10 +801,16 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         full_q_actual_seq: torch.Tensor,
         full_kv_actual_seq: torch.Tensor,
     ) -> None:
-        if attn_metadata.token_to_req is None:
+        token_to_req = attn_metadata.token_to_req
+        if token_to_req is None:
             raise RuntimeError(
                 "fused_overlap offload decode requires token_to_req metadata "
                 f"(num_tokens={num_tokens} num_reqs={num_reqs})"
+            )
+        if token_to_req.ndim != 1 or token_to_req.size(0) < num_tokens:
+            raise RuntimeError(
+                "fused_overlap token_to_req length mismatch: "
+                f"got shape {tuple(token_to_req.shape)} for num_tokens={num_tokens}"
             )
         if full_q_actual_seq.numel() != num_reqs:
             raise RuntimeError(
@@ -816,15 +822,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 "fused_overlap full_kv_actual_seq must have one entry per decode "
                 f"request: got {full_kv_actual_seq.numel()} for num_reqs={num_reqs}"
             )
-        if get_forward_context().capturing:
+        if get_forward_context().capturing or not envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA:
             return
-        token_to_req = attn_metadata.token_to_req[:num_tokens]
-        if token_to_req.numel() != num_tokens:
-            raise RuntimeError(
-                f"fused_overlap token_to_req length mismatch: got {token_to_req.numel()} for num_tokens={num_tokens}"
-            )
-        if not envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA:
-            return
+        token_to_req = token_to_req[:num_tokens]
         invalid_req_mapping = (token_to_req < 0) | (token_to_req >= num_reqs)
         if bool(invalid_req_mapping.any().item()):
             raise RuntimeError(
@@ -918,6 +918,21 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             return cached_inputs
 
         device = topk_indices_decode.device
+        full_kv_actual_seq = self._to_int32_device(
+            actual_seq_lengths_key_decode,
+            device,
+        )
+        full_q_actual_seq = self._to_int32_device(
+            actual_seq_lengths_query_decode,
+            device,
+        )
+        self._validate_fused_overlap_mtp_decode_metadata(
+            attn_metadata,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            full_q_actual_seq=full_q_actual_seq,
+            full_kv_actual_seq=full_kv_actual_seq,
+        )
         token_to_req = attn_metadata.token_to_req[:num_tokens].to(
             device=device,
             dtype=torch.long,
@@ -966,21 +981,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             attn_metadata.block_table[:num_reqs],
             device,
         ).contiguous()
-        full_kv_actual_seq = self._to_int32_device(
-            actual_seq_lengths_key_decode,
-            device,
-        )
-        full_q_actual_seq = self._to_int32_device(
-            actual_seq_lengths_query_decode,
-            device,
-        )
-        self._validate_fused_overlap_mtp_decode_metadata(
-            attn_metadata,
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            full_q_actual_seq=full_q_actual_seq,
-            full_kv_actual_seq=full_kv_actual_seq,
-        )
         if num_tokens != num_reqs:
             validate_device = not forward_context.capturing and envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA
             if HAS_TRITON and device.type == "npu" and not validate_device:

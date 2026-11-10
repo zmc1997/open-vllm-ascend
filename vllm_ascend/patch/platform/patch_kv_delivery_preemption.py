@@ -332,8 +332,13 @@ class KVDeliveryScheduler(Scheduler):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        # Send reset preemptions to the connector before admitting waiting requests.
+        # Otherwise cleanup for the old request can discard its new KV state.
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and not (self.connector is not None and self.reset_preempted_req_ids)
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -823,8 +828,8 @@ class KVDeliveryScheduler(Scheduler):
         method.
 
         drop_stale_output: drop (rather than deliver) any in-flight output; used
-        by reset_prefix_cache, whose same-step resume would otherwise deliver
-        tokens out of order, and for connectors with a pending KV hand-off,
+        by reset_prefix_cache, which invalidates earlier scheduled output,
+        and for connectors with a pending KV hand-off,
         which the preemption's block free would leave without valid KV.
         """
         assert request.status == RequestStatus.RUNNING, "Only running requests can be preempted"
@@ -1232,10 +1237,8 @@ class KVDeliveryScheduler(Scheduler):
                 request = self.running.pop()
                 self._preempt_request(request, timestamp, drop_stale_output=True)
 
-            # Clear scheduled request ids cache. Since we are forcing preemption
-            # + resumption in the same step, we must act as if these requests were
-            # not scheduled in the prior step. They will be flushed from the
-            # persistent batch in the model runner.
+            # Flush these requests from the model runner's persistent batch
+            # before resuming them.
             self.prev_step_scheduled_req_ids.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()

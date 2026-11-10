@@ -520,7 +520,7 @@ class KVPoolScheduler:
 
     @property
     def restores_shared_prefix(self) -> bool:
-        return self.layerwise_offload and self.kv_role == "kv_producer"
+        return self.layerwise_offload and self.kv_role in ("kv_producer", "kv_both")
 
     def get_local_prefix_cache_limit(self, request_id: str) -> int | None:
         if not self.restores_shared_prefix:

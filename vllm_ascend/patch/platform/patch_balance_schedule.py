@@ -403,8 +403,13 @@ class BalanceScheduler(KVDeliveryScheduler):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        # Send reset preemptions to the connector before admitting waiting requests.
+        # Otherwise cleanup for the old request can discard its new KV state.
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and not (self.connector is not None and self.reset_preempted_req_ids)
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -515,6 +520,10 @@ class BalanceScheduler(KVDeliveryScheduler):
                             step_skipped_waiting.prepend_request(request)
                             continue
 
+                        if ext_tokens == 0 and num_new_local_computed_tokens:
+                            new_computed_blocks, num_new_local_computed_tokens = self._limit_local_prefix_cache_hit(
+                                request, new_computed_blocks, num_new_local_computed_tokens
+                            )
                         num_external_computed_tokens = ext_tokens
 
                         connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens

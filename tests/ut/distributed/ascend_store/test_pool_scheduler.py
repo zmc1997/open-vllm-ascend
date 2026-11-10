@@ -114,23 +114,25 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(result, (0, False))
 
     def test_shared_mtp_prefix_does_not_extend_store_hit_to_local_hit(self):
-        scheduler = KVPoolScheduler(self._make_config(block_size=128), use_layerwise=True)
-        scheduler.use_gva_layerwise = True
-        scheduler.layerwise_offload = True
-        scheduler.use_eagle = True
-        scheduler._get_layerwise_gva_hit_tokens = MagicMock(side_effect=[2944 * 128, 0])
-        request = MagicMock(request_id="shared-prefix", num_tokens=389146, prompt_token_ids=range(389146))
+        for kv_role in ("kv_producer", "kv_both"):
+            with self.subTest(kv_role=kv_role):
+                scheduler = KVPoolScheduler(self._make_config(kv_role=kv_role, block_size=128), use_layerwise=True)
+                scheduler.use_gva_layerwise = True
+                scheduler.layerwise_offload = True
+                scheduler.use_eagle = True
+                scheduler._get_layerwise_gva_hit_tokens = MagicMock(side_effect=[2944 * 128, 0])
+                request = MagicMock(request_id="shared-prefix", num_tokens=389146, prompt_token_ids=range(389146))
 
-        assert scheduler.get_num_new_matched_tokens(request, 3008 * 128) == (0, False)
-        load_spec = scheduler.load_specs[request.request_id]
-        assert load_spec.can_load
-        assert load_spec.kvpool_cached_tokens == load_spec.kvpool_store_skip_tokens == 2944 * 128
-        assert scheduler.get_local_prefix_cache_limit(request.request_id) == 2944 * 128
+                assert scheduler.get_num_new_matched_tokens(request, 3008 * 128) == (0, False)
+                load_spec = scheduler.load_specs[request.request_id]
+                assert load_spec.can_load
+                assert load_spec.kvpool_cached_tokens == load_spec.kvpool_store_skip_tokens == 2944 * 128
+                assert scheduler.get_local_prefix_cache_limit(request.request_id) == 2944 * 128
 
-        # A new lookup that misses must not retain the older load plan.
-        assert scheduler.get_num_new_matched_tokens(request, 3008 * 128) == (0, False)
-        assert request.request_id not in scheduler.load_specs
-        assert scheduler.get_local_prefix_cache_limit(request.request_id) == 0
+                # A new lookup that misses must not retain the older load plan.
+                assert scheduler.get_num_new_matched_tokens(request, 3008 * 128) == (0, False)
+                assert request.request_id not in scheduler.load_specs
+                assert scheduler.get_local_prefix_cache_limit(request.request_id) == 0
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_hit(self, mock_client_cls):
