@@ -1117,9 +1117,20 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 cum_query_lens=actual_seq_lengths_query_decode,
             )
 
-        fused_query = torch.cat([ql_nope_decode, q_pe_decode], dim=-1).contiguous()
+        # Compact producer outputs can enter the existing split-Q ACLNN path directly.
+        split_query = (
+            envs_ascend.VLLM_ASCEND_FSA_SPLIT_QUERY
+            and ql_nope_decode.is_contiguous()
+            and q_pe_decode.is_contiguous()
+            and ql_nope_decode.dtype == q_pe_decode.dtype
+            and ql_nope_decode.device == q_pe_decode.device
+            and ql_nope_decode.shape[:-1] == q_pe_decode.shape[:-1]
+            and ql_nope_decode.size(-1) == full_kv_cache.size(-1)
+            and full_k_rope.numel() > 0
+            and q_pe_decode.size(-1) == full_k_rope.size(-1)
+        )
         fused_inputs = {
-            "query": fused_query,
+            "query": ql_nope_decode if split_query else torch.cat([ql_nope_decode, q_pe_decode], dim=-1).contiguous(),
             "selection_k_rope": selection_k_rope,
             "selection_kv_cache": selection_kv_cache,
             "selection_kv_block_table": selection_block_table,
@@ -1138,6 +1149,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             "layout_kv": "PA_BSND",
             "sparse_mode": 3,
         }
+        if split_query:
+            fused_inputs["query_rope"] = q_pe_decode
         manager.inject_current_kv_into_selection(
             layer_name=layer_name,
             num_tokens=num_tokens,

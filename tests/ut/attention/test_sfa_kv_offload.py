@@ -223,10 +223,20 @@ def test_mtp_rewrite_invalidates_membership_slot_map():
     assert bool((control[:, 0] == -1).all())
 
 
-def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
+@pytest.mark.parametrize("query_layout", ["compact", "strided", "mixed_dtype", "rope_width_mismatch"])
+@pytest.mark.parametrize("split_query_enabled", [True, False])
+def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state(query_layout, split_query_enabled):
     impl = _make_fused_overlap_impl()
     ql_nope = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
     q_pe = torch.ones((2, 2, 1), dtype=torch.float32)
+    if query_layout == "strided":
+        ql_nope = ql_nope.transpose(0, 1)
+    elif query_layout == "mixed_dtype":
+        q_pe = q_pe.to(torch.float64)
+    elif query_layout == "rope_width_mismatch":
+        q_pe = q_pe.repeat(1, 1, 2)
+    separate_query = split_query_enabled and query_layout == "compact"
+    expected_query = ql_nope if separate_query else torch.cat([ql_nope, q_pe], dim=-1)
     topk = torch.tensor([[0, -1, 2, 5], [3, 7, 1, -1]], dtype=torch.int64)
     full_kv_cpu = torch.zeros((3, 4, 1, 3), dtype=torch.float32)
     full_rope_cpu = torch.zeros((3, 4, 1, 1), dtype=torch.float32)
@@ -290,6 +300,10 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
 
     with (
         patch.object(impl, "_require_custom_op", return_value=fused_op),
+        patch.object(torch, "cat", wraps=torch.cat) as cat,
+        patch(
+            "vllm_ascend.attention.sfa_kv_offload.envs_ascend.VLLM_ASCEND_FSA_SPLIT_QUERY", split_query_enabled
+        ),
         patch(
             "vllm_ascend.attention.sfa_kv_offload.get_sparse_kv_offload_manager",
             return_value=manager,
@@ -309,7 +323,7 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
             "model.layers.0.self_attn",
         )
 
-    torch.testing.assert_close(output, ql_nope + 10)
+    torch.testing.assert_close(output, expected_query[..., : ql_nope.shape[-1]] + 10)
     assert call_order == [
         "plan",
         "inject",
@@ -322,10 +336,14 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
     assert fused_inputs["selection_kv_block_status"].shape == (4, 1, 8)
     assert fused_inputs["selection_membership_map"].shape == (4, 16400)
     assert fused_inputs["selection_membership_map"].dtype == torch.int16
-    torch.testing.assert_close(
-        fused_inputs["query"],
-        torch.cat([ql_nope, q_pe], dim=-1),
-    )
+    if separate_query:
+        cat.assert_not_called()
+        assert fused_inputs["query"] is ql_nope
+        assert fused_inputs["query_rope"] is q_pe
+    else:
+        cat.assert_called_once()
+        assert "query_rope" not in fused_inputs
+        torch.testing.assert_close(fused_inputs["query"], expected_query)
     assert plan_inputs["selection_membership_map"].data_ptr() == fused_inputs["selection_membership_map"].data_ptr()
     expected_topk = torch.tensor(
         [[[0, -1, 2, 5]], [[3, 7, 1, -1]]],

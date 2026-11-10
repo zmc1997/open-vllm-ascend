@@ -126,6 +126,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FSA_REUSE_LRU_PLAN_INPUTS": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FSA_REUSE_LRU_PLAN_INPUTS", "1"))
     ),
+    # Pass compatible NoPE/RoPE queries separately to fused-overlap FSA (default: 1).
+    "VLLM_ASCEND_FSA_SPLIT_QUERY": lambda: bool(int(os.getenv("VLLM_ASCEND_FSA_SPLIT_QUERY", "1"))),
     # Non-sensitive. Merge the first eager MTP metadata sync into the main
     # synchronous DP all_reduce when every rank can predict its draft shape.
     # 0 (default) preserves separate collectives. Set identically before all
