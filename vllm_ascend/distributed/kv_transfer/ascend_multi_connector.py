@@ -129,6 +129,16 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
 
         return super().get_num_new_matched_tokens(request, num_computed_tokens)
 
+    def get_local_prefix_cache_limit(self, request_id: str) -> int | None:
+        limit = None
+        for connector in self._connectors:
+            get_limit = getattr(connector, "get_local_prefix_cache_limit", None)
+            if get_limit is not None:
+                child_limit = get_limit(request_id)
+                if child_limit is not None:
+                    limit = child_limit if limit is None else min(limit, child_limit)
+        return limit
+
     def update_state_before_preempt(
         self,
         request: "Request",

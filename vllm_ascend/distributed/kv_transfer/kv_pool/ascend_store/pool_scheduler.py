@@ -518,6 +518,16 @@ class KVPoolScheduler:
         ]
         return tuple(clipped) if isinstance(block_ids, tuple) else clipped
 
+    @property
+    def restores_shared_prefix(self) -> bool:
+        return self.layerwise_offload and self.kv_role == "kv_producer"
+
+    def get_local_prefix_cache_limit(self, request_id: str) -> int | None:
+        if not self.restores_shared_prefix:
+            return None
+        load_spec = self.load_specs.get(request_id)
+        return load_spec.vllm_cached_tokens if load_spec is not None else 0
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -535,6 +545,9 @@ class KVPoolScheduler:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+        if self.restores_shared_prefix:
+            # A waiting request can be looked up again after a prior hit.
+            self.load_specs.pop(request.request_id, None)
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
 
@@ -578,8 +591,18 @@ class KVPoolScheduler:
             return 0, False
 
         store_skip_tokens = num_external_hit_tokens
-        if self.use_layerwise and self.use_eagle:
-            # TODO(lf): Support loading the trailing block as dirty data.
+        if self.restores_shared_prefix:
+            if self.use_layerwise and self.use_eagle:
+                # The shared HBM slots cannot replace the discarded tail block.
+                # Compute the safe load extent before trimming the local hit.
+                num_external_hit_tokens = self._floor_to_cache_transfer_granularity(
+                    max(0, num_external_hit_tokens - self.lcm_block_size)
+                )
+            elif num_external_hit_tokens < num_computed_tokens:
+                num_external_hit_tokens = self._floor_to_cache_transfer_granularity(num_external_hit_tokens)
+            num_computed_tokens = min(num_computed_tokens, num_external_hit_tokens)
+        elif self.use_layerwise and self.use_eagle:
+            # Ordinary local KV still provides a valid lower bound on reuse.
             num_external_hit_tokens = max(
                 num_computed_tokens,
                 num_external_hit_tokens - self.lcm_block_size,

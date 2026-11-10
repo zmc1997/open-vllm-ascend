@@ -28,6 +28,15 @@ def _make_connector(*, requires_full_blocks: bool = False):
     )
 
 
+def test_local_prefix_limit_preserves_a_store_miss():
+    connector = AscendMultiConnector.__new__(AscendMultiConnector)
+    store = SimpleNamespace(get_local_prefix_cache_limit=MagicMock(return_value=0))
+    connector._connectors = [SimpleNamespace(), store]
+
+    assert connector.get_local_prefix_cache_limit("req-0") == 0
+    store.get_local_prefix_cache_limit.assert_called_once_with("req-0")
+
+
 def test_update_state_after_alloc_forwards_full_blocks_to_observer():
     chosen = _make_connector()
     full_blocks_observer = _make_connector(requires_full_blocks=True)

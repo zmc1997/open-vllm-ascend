@@ -250,8 +250,30 @@ def test_48245_output_update_keeps_stale_checks_in_original_flow():
     assert [source.index(marker) for marker in markers] == sorted(source.index(marker) for marker in markers)
 
 
+@pytest.mark.parametrize("limit", [0, 32])
+def test_shared_prefix_limit_trims_each_group_before_allocation(limit):
+    scheduler = backport.KVDeliveryScheduler.__new__(backport.KVDeliveryScheduler)
+    scheduler.connector = SimpleNamespace(get_local_prefix_cache_limit=lambda _req_id: limit)
+    scheduler.kv_cache_manager = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            single_type_managers=[SimpleNamespace(block_size=16), SimpleNamespace(block_size=32)]
+        ),
+        create_kv_cache_blocks=backport.KVCacheBlocks,
+    )
+    request = SimpleNamespace(request_id="req-0", shared_prefix_boundary=96)
+    original = backport.KVCacheBlocks(([0, 1, 2, 3], [4, 5]))
+
+    limited, local_tokens = scheduler._limit_local_prefix_cache_hit(request, original, 64)
+
+    assert local_tokens == limit
+    expected_blocks = ([0, 1], [4]) if limit else ([], [])
+    assert limited.blocks == expected_blocks
+    assert original.blocks == ([0, 1, 2, 3], [4, 5])
+    assert request.shared_prefix_boundary == 0
+
+
 def _kv_schedule_body_ast(source: str) -> str:
-    """Strip only the two PR scheduler deltas from a schedule body."""
+    """Strip the explicit Ascend scheduler deltas from a schedule body."""
     tree = ast.parse(textwrap.dedent(source))
     func = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "schedule")
 
@@ -264,6 +286,8 @@ def _kv_schedule_body_ast(source: str) -> str:
 
         def visit_If(self, node: ast.If):  # noqa: N802
             if "num_stale_output_tokens" in ast.dump(node.test) and "drop_stale_output" in ast.dump(node.test):
+                return None
+            if ast.unparse(node.test) == "ext_tokens == 0 and num_new_local_computed_tokens":
                 return None
             return self.generic_visit(node)
 

@@ -146,6 +146,10 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
+    def get_local_prefix_cache_limit(self, request_id: str) -> int | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_local_prefix_cache_limit(request_id)
+
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
