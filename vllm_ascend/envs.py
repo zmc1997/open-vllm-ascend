@@ -122,6 +122,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA", "0"))
     ),
+    # Non-sensitive. Merge the first eager MTP metadata sync into the main
+    # synchronous DP all_reduce when every rank can predict its draft shape.
+    # 0 (default) preserves separate collectives. Set identically before all
+    # workers start; changing this setting requires restarting every DP rank.
+    "VLLM_ASCEND_MERGE_MTP_DP_SYNC": lambda: bool(int(os.getenv("VLLM_ASCEND_MERGE_MTP_DP_SYNC", "0"))),
 }
 
 # end-env-vars-definition

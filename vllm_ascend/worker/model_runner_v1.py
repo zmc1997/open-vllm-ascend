@@ -26,7 +26,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
-from functools import partial
+from functools import partial, wraps
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
@@ -111,6 +111,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -286,6 +287,35 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+
+
+_MERGE_MTP_DP_SYNC = ascend_envs.VLLM_ASCEND_MERGE_MTP_DP_SYNC
+_MTP_DP_DUMMY_LOCAL = -1
+_MTP_DP_DUMMY_PADDED = -2
+
+
+def _dp_sync_lifetime(*, new_step: bool, keep_for_sample: bool = False):
+    """Keep a prediction only until this step's first draft sync or exit."""
+    def decorate(method):
+        if not _MERGE_MTP_DP_SYNC:
+            return method
+
+        @wraps(method)
+        def wrapped(self, *args, **kwargs):
+            if new_step:
+                self._mtp_dp_sync_role = 0
+                self._merged_mtp_dp_sync = None
+            try:
+                return method(self, *args, **kwargs)
+            except BaseException:
+                self._merged_mtp_dp_sync = None
+                raise
+            finally:
+                self._mtp_dp_sync_role = 0
+                if not keep_for_sample or self.__dict__.get("execute_model_state") is None:
+                    self._merged_mtp_dp_sync = None
+        return wrapped
+    return decorate
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -705,7 +735,19 @@ class NPUModelRunner(GPUModelRunner):
         is_draft_model: bool = False,
         cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         allow_dp_padding: bool = False,
+        *,
+        prepare_inputs_during_sync: Callable[[], None] | None = None,
     ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
+        if _MERGE_MTP_DP_SYNC:
+            cached = self.__dict__.pop("_merged_mtp_dp_sync", None)
+            if is_draft_model and cached is not None:
+                expected_tokens, result = cached
+                # Peers have agreed to omit this collective. A local fallback
+                # would change collective ordering and can deadlock the group.
+                if num_tokens != expected_tokens or cudagraph_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError("Merged MTP DP metadata prediction does not match draft input")
+                return result
+
         # TODO: In vLLM, the only thing that needs to be synced is num_tokens, but in
         # our case, we still need to sync the other two flags as well. So we need to
         # include them in the all_reduce operation, and more over, we CANNOT skip it
@@ -719,15 +761,47 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
-        packed_tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
+        merge = _MERGE_MTP_DP_SYNC and not is_draft_model
+        packed_tensor = torch.zeros(3 if merge else 2, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
-        dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
+        if merge:
+            role = self.__dict__.get("_mtp_dp_sync_role", 0)
+            if role == _MTP_DP_DUMMY_LOCAL and allow_dp_padding:
+                role = _MTP_DP_DUMMY_PADDED
+            packed_tensor[2][self.dp_rank] = role
+        group = get_dp_group().cpu_group
+        if prepare_inputs_during_sync is None:
+            dist.all_reduce(packed_tensor, group=group)
+        else:
+            work = dist.all_reduce(packed_tensor, group=group, async_op=True)
+            try:
+                prepare_inputs_during_sync()
+            finally:
+                # Drain the submitted collective even when input preparation fails.
+                work.wait()
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
+
+        if merge:
+            # This metadata is already on CPU and has one entry per DP rank.
+            roles = packed_tensor[2].tolist()
+            if all(role > 0 or role in (_MTP_DP_DUMMY_LOCAL, _MTP_DP_DUMMY_PADDED) for role in roles):
+                draft_counts = [
+                    max_tokens_across_dp if role == _MTP_DP_DUMMY_PADDED
+                    else tokens if role == _MTP_DP_DUMMY_LOCAL
+                    else role
+                    for role, tokens in zip(roles, num_tokens_across_dp.tolist())
+                ]
+                draft_max = max(draft_counts)
+                self._merged_mtp_dp_sync = (
+                    draft_counts[self.dp_rank],
+                    (draft_max, torch.full((self.dp_size,), draft_max, device="cpu", dtype=torch.int32),
+                     CUDAGraphMode.NONE),
+                )
 
         # Create a tensor for num_tokens_after_padding
         if allow_dp_padding or is_draft_model:
@@ -738,6 +812,47 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding = num_tokens_across_dp.cpu()
 
         return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
+
+    def _can_merge_mtp_dp_sync(self) -> bool:
+        # These paths preserve target_token_ids.shape[0] for the first draft
+        # pass. Expanded/unpadded batches, DCP, PP, DBO and graph draft dispatch
+        # can change it after the main-model synchronization.
+        return (
+            _MERGE_MTP_DP_SYNC
+            and type(self) is NPUModelRunner
+            and self.dp_size > 1
+            and self.dcp_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not self.parallel_config.enable_dbo
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and not self.speculative_config.disable_padded_drafter_batch
+            and type(self.drafter) is AscendEagleProposer
+            and not self.drafter.use_cuda_graph
+            and not self.drafter.needs_extra_input_slots
+            and not self.input_batch.lora_id_to_lora_request
+            and not should_skip_allreduce_across_dp_group(self.vllm_config, False)
+            and not should_skip_allreduce_across_dp_group(self.vllm_config, True)
+        )
+
+    def _mtp_dp_sync_active_role(self, scheduler_output, tokens: list[int]) -> int:
+        if not self._can_merge_mtp_dp_sync():
+            return 0
+        num_reqs = self.input_batch.num_reqs
+        if (
+            len(tokens) != num_reqs or not tokens
+            or any(t <= 0 or t > self.uniform_decode_query_len for t in tokens)
+            or sum(tokens) != scheduler_output.total_num_scheduled_tokens
+            or scheduler_output.scheduled_encoder_inputs
+            or not np.all(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                >= self.input_batch.num_prompt_tokens[:num_reqs]
+            )
+        ):
+            return 0
+        # Padded eager drafting retains rejected positions; the CPU-known
+        # unpadded query length is the first-pass draft input length.
+        return sum(tokens)
 
     def _get_lmhead_pad_size(self, num_tokens_across_dp: torch.Tensor | None) -> int:
         pad_size = self.max_num_reqs * self.uniform_decode_query_len
@@ -1420,7 +1535,6 @@ class NPUModelRunner(GPUModelRunner):
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        # TODO: Optimize the CPU -> NPU copy.
         cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).pin_memory().to(self.device, non_blocking=True)
         cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).pin_memory().to(self.device, non_blocking=True)
         logits_indices = torch.from_numpy(logits_indices).pin_memory().to(self.device, non_blocking=True)
@@ -1801,6 +1915,7 @@ class NPUModelRunner(GPUModelRunner):
             self.draft_token_ids_event.record()
 
     @torch.inference_mode()
+    @_dp_sync_lifetime(new_step=True, keep_for_sample=True)
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1938,14 +2053,21 @@ class NPUModelRunner(GPUModelRunner):
                 self._start_dump_data()
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-                (
-                    logits_indices,
-                    spec_decode_metadata,
-                    total_num_scheduled_tokens,
-                ) = self._prepare_inputs(
-                    scheduler_output,
-                    num_scheduled_tokens_np,
-                )
+                if _MERGE_MTP_DP_SYNC:
+                    self._mtp_dp_sync_role = self._mtp_dp_sync_active_role(scheduler_output, tokens)
+                determine_batch = self._determine_batch_execution_and_padding
+                if _MERGE_MTP_DP_SYNC and self._mtp_dp_sync_role > 0:
+                    # The active role guarantees the main DP sync and local dispatch
+                    # metadata is already known. Keep prepare inside its existing fence.
+                    prepared_inputs = None
+
+                    def prepare_inputs_during_sync() -> None:
+                        nonlocal prepared_inputs
+                        prepared_inputs = self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
+
+                    determine_batch = partial(determine_batch, prepare_inputs_during_sync=prepare_inputs_during_sync)
+                else:
+                    prepared_inputs = self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 cascade_attn_prefix_lens = None
@@ -1964,7 +2086,7 @@ class NPUModelRunner(GPUModelRunner):
                     should_ubatch,
                     num_tokens_across_dp,
                     cudagraph_stats,
-                ) = self._determine_batch_execution_and_padding(
+                ) = determine_batch(
                     num_tokens=num_tokens_unpadded,
                     num_reqs=num_reqs,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
@@ -1973,6 +2095,8 @@ class NPUModelRunner(GPUModelRunner):
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+                assert prepared_inputs is not None
+                logits_indices, spec_decode_metadata, total_num_scheduled_tokens = prepared_inputs
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -2230,6 +2354,7 @@ class NPUModelRunner(GPUModelRunner):
         return None
 
     @torch.inference_mode()
+    @_dp_sync_lifetime(new_step=False)
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -2803,6 +2928,7 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        prepare_inputs_during_sync: Callable[[], None] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
@@ -2849,7 +2975,10 @@ class NPUModelRunner(GPUModelRunner):
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_metadata_across_dp(
+            sync_metadata = self._sync_metadata_across_dp
+            if prepare_inputs_during_sync is not None:
+                sync_metadata = partial(sync_metadata, prepare_inputs_during_sync=prepare_inputs_during_sync)
+            _, num_tokens_across_dp, synced_cudagraph_mode = sync_metadata(
                 num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,
                 allow_dp_padding=((cudagraph_mode != CUDAGraphMode.NONE)
@@ -3254,6 +3383,7 @@ class NPUModelRunner(GPUModelRunner):
         return force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
 
     @torch.inference_mode()
+    @_dp_sync_lifetime(new_step=True)
     def _dummy_run(
         self,
         num_tokens: int,
@@ -3318,6 +3448,12 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        if (
+            _MERGE_MTP_DP_SYNC and self._can_merge_mtp_dp_sync() and uniform_decode and num_active_loras == 0
+            and cudagraph_runtime_mode is None
+            and not (with_prefill or is_profile or profile_cpp or is_graph_capturing or create_mixed_batch)
+        ):
+            self._mtp_dp_sync_role = _MTP_DP_DUMMY_LOCAL
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
