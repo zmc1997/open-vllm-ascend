@@ -453,7 +453,8 @@ at::Tensor npu_fused_sparse_attention_overlap_meta(
     int64_t selection_topk_block_size,
     c10::string_view layout_query,
     c10::string_view layout_kv,
-    int64_t sparse_mode)
+    int64_t sparse_mode,
+    const c10::optional<at::Tensor> & /*query_rope*/)
 {
     // The real op returns the nope-width output (query_nope.sizes), i.e. the
     // last dim is full_kv_cache's last dim, not query's. Keep the meta in sync

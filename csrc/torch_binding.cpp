@@ -3171,7 +3171,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor full_k_rope, Tensor full_kv_cache, Tensor full_kv_block_table, "
         "Tensor full_kv_actual_seq, Tensor full_q_actual_seq, "
         "float scale_value, int sparse_block_size, int selection_topk_block_size, *, "
-        "str layout_query='TND', str layout_kv='PA_BSND', int sparse_mode=3) -> Tensor"
+        "str layout_query='TND', str layout_kv='PA_BSND', int sparse_mode=3, Tensor? query_rope=None) -> Tensor"
     );
     ops.impl("npu_fused_sparse_attention_overlap", torch::kPrivateUse1,
              &vllm_ascend::npu_fused_sparse_attention_overlap);

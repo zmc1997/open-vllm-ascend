@@ -188,22 +188,38 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffect(
     int64_t selection_topk_block_size,
     const std::string &layout_query_str,
     const std::string &layout_kv_str,
-    int64_t sparse_mode)
+    int64_t sparse_mode,
+    const c10::optional<at::Tensor> &split_query_rope)
 {
     CheckPositiveShape(query, "query");
     int64_t last_dim = query.dim() - 1;
-    int64_t query_dim = query.size(last_dim);
-    int64_t kv_cache_dim = full_kv_cache.size(full_kv_cache.dim() - 1);
     int64_t k_rope_dim = full_k_rope.defined() && full_k_rope.numel() > 0
                              ? full_k_rope.size(full_k_rope.dim() - 1)
                              : 0;
-    TORCH_CHECK(query_dim >= kv_cache_dim,
-                "query last dim should be >= full_kv_cache last dim, but got ", query_dim, " and ", kv_cache_dim);
-    at::Tensor query_nope = query.slice(last_dim, 0, kv_cache_dim);
-    at::Tensor query_rope = (k_rope_dim > 0 && query_dim >= kv_cache_dim + k_rope_dim)
-                                ? query.slice(last_dim, kv_cache_dim, kv_cache_dim + k_rope_dim)
-                                : at::Tensor();
-    at::Tensor sfa_output = RunFusedSparseAttentionOverlapSideEffectImpl(
+    at::Tensor query_nope;
+    at::Tensor query_rope;
+    if (split_query_rope.has_value()) {
+        query_nope = query;
+        query_rope = *split_query_rope;
+        TORCH_CHECK(query_rope.defined() && last_dim >= 0 && query_rope.dim() == query.dim(),
+                    "query_rope must have the same positive rank as query");
+        TORCH_CHECK(query_rope.sizes().slice(0, last_dim) == query.sizes().slice(0, last_dim),
+                    "query_rope leading dimensions must match query");
+        TORCH_CHECK(query_rope.scalar_type() == query.scalar_type() && query_rope.device() == query.device(),
+                    "query_rope dtype and device must match query");
+        TORCH_CHECK(k_rope_dim > 0 && query_rope.size(last_dim) == k_rope_dim,
+                    "query_rope last dim must match full_k_rope last dim");
+    } else {
+        int64_t query_dim = query.size(last_dim);
+        int64_t kv_cache_dim = full_kv_cache.size(full_kv_cache.dim() - 1);
+        TORCH_CHECK(query_dim >= kv_cache_dim,
+                    "query last dim should be >= full_kv_cache last dim, but got ", query_dim, " and ", kv_cache_dim);
+        query_nope = query.slice(last_dim, 0, kv_cache_dim);
+        if (k_rope_dim > 0 && query_dim >= kv_cache_dim + k_rope_dim) {
+            query_rope = query.slice(last_dim, kv_cache_dim, kv_cache_dim + k_rope_dim);
+        }
+    }
+    return RunFusedSparseAttentionOverlapSideEffectImpl(
         query_nope,
         query_rope,
         selection_k_rope,
@@ -223,8 +239,6 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffect(
         layout_query_str,
         layout_kv_str,
         sparse_mode);
-
-    return sfa_output;
 }
 
 inline at::Tensor npu_fused_sparse_attention_overlap(
@@ -245,7 +259,8 @@ inline at::Tensor npu_fused_sparse_attention_overlap(
     int64_t selection_topk_block_size,
     c10::string_view layout_query,
     c10::string_view layout_kv,
-    int64_t sparse_mode)
+    int64_t sparse_mode,
+    const c10::optional<at::Tensor> &query_rope = c10::nullopt)
 {
     return RunFusedSparseAttentionOverlapSideEffect(
         query,
@@ -265,7 +280,8 @@ inline at::Tensor npu_fused_sparse_attention_overlap(
         selection_topk_block_size,
         std::string(layout_query),
         std::string(layout_kv),
-        sparse_mode);
+        sparse_mode,
+        query_rope);
 }
 
 inline at::Tensor npu_fused_sparse_attention_overlap_cpu_source(
