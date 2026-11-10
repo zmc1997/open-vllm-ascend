@@ -406,6 +406,99 @@ def test_capture_without_fused_overlap_stays_on_current_stream():
     manager.fused_plan_stream.wait_event.assert_not_called()
 
 
+def test_external_plan_reuses_only_last_common_inputs_in_capture_scope():
+    manager = _make_plan_manager()
+    manager.tp_size = 2
+    manager.fused_plan_stream = MagicMock()
+    manager.current_kv_save_stream = MagicMock()
+    current_stream = MagicMock()
+    context = SimpleNamespace()
+    operations = []
+    ready = object()
+    current_stream.record_event.side_effect = lambda: operations.append("record") or ready
+    manager.fused_plan_stream.wait_event.side_effect = lambda event: operations.append(("wait_input", event))
+    manager.fused_plan_stream.wait_stream.side_effect = lambda stream: operations.append(("wait_save", stream))
+    manager.sparse_kv_offload_cpp.enqueue_lru_resident_compact_with_plan_stable_rows.side_effect = (
+        lambda *_args: operations.append("planner")
+    )
+    manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows.side_effect = (
+        lambda *_args: operations.append("planner")
+    )
+    manager.tp_group.broadcast.side_effect = lambda *_args, **_kwargs: operations.append("broadcast")
+
+    host_inputs = {
+        "topk": manager.lru_topk_indices_cpu,
+        "req_ids": manager.lru_req_ids_cpu,
+        "stable_prefix": manager.lru_stable_prefix_lens_cpu,
+        "visible_lengths": manager.lru_visible_seq_lens_cpu,
+    }
+    target_names = {target.data_ptr(): name for name, target in host_inputs.items()}
+    target_names[manager.fused_plan_current_linear_slots_npu.data_ptr()] = "slots"
+    real_copy = torch.Tensor.copy_
+
+    def record_copy(target, source, non_blocking=False):
+        name = target_names.get(target.data_ptr())
+        if name is not None:
+            operations.append((name, non_blocking))
+        return real_copy(target, source, non_blocking=non_blocking)
+
+    membership = torch.full((4, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT), -1, dtype=torch.int16)
+    common = (
+        torch.tensor([101, 202]),
+        torch.tensor([10, 20], dtype=torch.int32),
+        torch.tensor([11, 21], dtype=torch.int32),
+    )
+
+    def check_plan(layer, inputs, *, copy_common=True, capturing=True):
+        operations.clear()
+        num_tokens = inputs[0].numel()
+        topk = torch.full((num_tokens, manager.topk), layer + 1, dtype=torch.int32)
+        assert manager.prepare_fused_overlap_external_plan(
+            f"layer.{layer}", num_tokens, topk, *inputs, membership, capturing=capturing
+        )
+        expected = ["record", ("wait_input", ready)] if capturing else []
+        if manager.tp_rank == 0:
+            copied = host_inputs if copy_common else ("topk",)
+            expected.extend((name, capturing) for name in copied)
+            expected.extend(["planner", ("slots", capturing)])
+            if capturing:
+                expected.append(("wait_save", manager.current_kv_save_stream))
+        assert operations == [*expected, "broadcast"]
+        if manager.tp_rank == 0:
+            for target, source in zip(host_inputs.values(), (topk, *inputs)):
+                torch.testing.assert_close(target[:num_tokens], source)
+
+    with (
+        patch.object(manager_module, "get_forward_context", return_value=context),
+        patch.object(manager_module, "is_forward_context_available", return_value=True),
+        patch.object(manager_module.torch_npu.npu, "current_stream", return_value=current_stream),
+        patch.object(manager_module.torch_npu.npu, "stream", return_value=nullcontext()),
+        patch.object(torch.Tensor, "copy_", new=record_copy),
+    ):
+        with patch.object(context, "_fsa_lru_plan_common_inputs", None, create=True):
+            check_plan(0, common)
+            check_plan(1, common, copy_common=False)
+            # Any single common source change replaces the last writer. The
+            # original sources need copying again after that intervening write.
+            for index in range(len(common)):
+                changed = tuple(tensor + 1 if i == index else tensor for i, tensor in enumerate(common))
+                check_plan(2, changed)
+                check_plan(3, common)
+            for tensor in common:
+                tensor.resize_(1)
+            check_plan(4, common)
+            check_plan(0, common, copy_common=False)
+            check_plan(1, common, capturing=False)
+
+        check_plan(0, common)
+        check_plan(1, common)
+        with patch.object(context, "_fsa_lru_plan_common_inputs", None, create=True):
+            check_plan(0, common)
+            check_plan(1, common, copy_common=False)
+            manager.tp_rank = 1
+            check_plan(2, common)
+
+
 @pytest.mark.parametrize("native_layout", [False, True], ids=["direct_2d", "native_4d"])
 def test_current_kv_injection_uses_planner_linear_slots_and_sentinel(native_layout):
     manager = _make_plan_manager()

@@ -166,6 +166,17 @@ class ACLGraphWrapper:
             aclgraph = torch.npu.NPUGraph()
 
             with ExitStack() as stack:
+                if (
+                    ascend_envs.VLLM_ASCEND_FSA_REUSE_LRU_PLAN_INPUTS
+                    and self.runtime_mode == CUDAGraphMode.FULL
+                    and not self.enable_enpu
+                    and not self.vllm_config.parallel_config.enable_dbo
+                    and not _EXTRA_CTX.is_draft_model
+                ):
+                    # Keep the shared pinned planner inputs local to this capture.
+                    stack.enter_context(
+                        patch.object(forward_context, "_fsa_lru_plan_common_inputs", None, create=True)
+                    )
                 if ascend_envs.VLLM_ASCEND_FSA_REUSE_WRITEBACK_LAYOUT:
                     stack.enter_context(
                         patch.object(forward_context, "ascend_graph_capture_token", object(), create=True)

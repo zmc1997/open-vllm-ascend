@@ -17,7 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionBackend
@@ -1597,15 +1597,34 @@ class SparseKVOffloadManager:
             )
 
         def copy_inputs(non_blocking: bool) -> None:
-            for target, tensor in (
+            copies = (
                 (self.lru_topk_indices_cpu, topk_indices_npu),
                 (self.lru_req_ids_cpu, req_ids_npu),
                 (self.lru_stable_prefix_lens_cpu, stable_prefix_lens_npu),
                 (self.lru_visible_seq_lens_cpu, visible_seq_lens_npu),
-            ):
+            )
+            context = get_forward_context() if capturing and is_forward_context_available() else None
+            track_common = context is not None and hasattr(context, "_fsa_lru_plan_common_inputs")
+            last_writer = context._fsa_lru_plan_common_inputs if track_common else None
+            if last_writer is not None:
+                manager, rows, req_ids, prefix_lens, visible_lens = last_writer
+                if (
+                    manager is self
+                    and rows == num_tokens
+                    and req_ids is req_ids_npu
+                    and prefix_lens is stable_prefix_lens_npu
+                    and visible_lens is visible_seq_lens_npu
+                ):
+                    copies = copies[:1]
+            for target, tensor in copies:
                 target[:num_tokens].copy_(tensor, non_blocking=non_blocking)
                 if non_blocking and not capturing:
                     tensor.record_stream(self.fused_plan_stream)
+            if track_common and len(copies) > 1:
+                # The first writer is captured and therefore refreshes the buffers on every replay.
+                context._fsa_lru_plan_common_inputs = (
+                    self, num_tokens, req_ids_npu, stable_prefix_lens_npu, visible_seq_lens_npu
+                )
 
         if async_plan:
             plan_inputs_ready = torch_npu.npu.current_stream().record_event()
