@@ -433,8 +433,14 @@ class RecomputeScheduler(Scheduler):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Next, schedule the WAITING requests.
-        if not preempted_reqs and not recomputed_reqs and self._pause_state == PauseState.UNPAUSED:
+        # Send reset preemptions to the connector before admitting waiting requests.
+        # Otherwise cleanup for the old request can discard its new KV state.
+        if (
+            not preempted_reqs
+            and not recomputed_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and not (self.connector is not None and self.reset_preempted_req_ids)
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:

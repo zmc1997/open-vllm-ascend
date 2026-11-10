@@ -11,6 +11,7 @@ import subprocess
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -169,6 +170,66 @@ def test_reset_prefix_cache_uses_drop_mode_for_same_step_resume():
     assert scheduler.prev_step_scheduled_req_ids == set()
 
 
+def test_reset_prefix_cache_sends_connector_cleanup_before_resuming():
+    request = _request()
+    request.num_tokens = 32
+    request.prefill_stats = None
+    request.has_encoder_inputs = False
+    request.use_structured_output = False
+    scheduler = _scheduler()
+    scheduler.running = [request]
+    scheduler.requests = {request.request_id: request}
+    scheduler.prev_step_scheduled_req_ids = {request.request_id}
+    scheduler.current_step = 0
+    scheduler._pause_state = backport.PauseState.UNPAUSED
+    scheduler.max_num_scheduled_tokens = request.num_tokens
+    scheduler.max_num_encoder_input_tokens = 0
+    scheduler.kv_cache_manager = Mock(
+        reset_prefix_cache=Mock(return_value=True),
+        get_computed_blocks=Mock(return_value=(backport.KVCacheBlocks(([],)), 0, 0)),
+        take_kv_cache_block_copies=Mock(return_value=([], [])),
+    )
+    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    scheduler.encoder_cache_manager.get_freed_mm_hashes = lambda: []
+    scheduler.policy = backport.SchedulingPolicy.FCFS
+    scheduler.waiting = backport.create_request_queue(scheduler.policy)
+    scheduler.skipped_waiting = backport.create_request_queue(scheduler.policy)
+    scheduler.num_waiting_for_streaming_input = 0
+    scheduler.max_num_running_reqs = 1
+    scheduler.lora_config = None
+    scheduler.has_mamba_layers = False
+    scheduler.num_spec_tokens = 0
+    scheduler.num_lookahead_tokens = 0
+    scheduler.scheduler_config = SimpleNamespace(long_prefill_token_threshold=0, enable_chunked_prefill=True)
+    scheduler.need_mamba_block_aligned_split = False
+    scheduler.is_encoder_decoder = False
+    scheduler.scheduler_reserve_full_isl = False
+    scheduler.connector_prefix_cache_stats = None
+    scheduler.dynamic_sd_lookup = None
+    scheduler.use_v2_model_runner = False
+    scheduler.finished_req_ids = set()
+    scheduler.ec_connector = None
+    scheduler.defer_block_free = False
+    scheduler.enable_return_routed_experts = False
+    scheduler._make_cached_request_data = Mock()
+    scheduler._get_new_block_ids_to_zero = Mock(return_value=None)
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    cleanup = scheduler.schedule()
+    assert cleanup.preempted_req_ids == {request.request_id}
+    assert cleanup.total_num_scheduled_tokens == 0
+    scheduler.connector.update_state_after_alloc.assert_not_called()
+    scheduler.connector.build_connector_meta.assert_called_once_with(cleanup)
+
+    resumed = scheduler.schedule()
+    assert not resumed.preempted_req_ids
+    assert resumed.num_scheduled_tokens == {request.request_id: request.num_tokens}
+    assert scheduler.running == [request]
+    scheduler.connector.update_state_after_alloc.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("is_stale", "expected_placeholders"),
     [(True, 0), (False, 2)],
@@ -285,6 +346,10 @@ def _kv_schedule_body_ast(source: str) -> str:
             return node
 
         def visit_If(self, node: ast.If):  # noqa: N802
+            if isinstance(node.test, ast.BoolOp) and ast.unparse(node.test.values[-1]) == (
+                "not (self.connector is not None and self.reset_preempted_req_ids)"
+            ):
+                node.test.values.pop()
             if "num_stale_output_tokens" in ast.dump(node.test) and "drop_stale_output" in ast.dump(node.test):
                 return None
             if ast.unparse(node.test) == "ext_tokens == 0 and num_new_local_computed_tokens":
