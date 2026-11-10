@@ -247,6 +247,21 @@ class AscendCompiler(CompilerInterface):
         }
         if get_ascend_config().multistream_sfa_indexer_overlap:
             factors["sfa_indexer_overlap_stage"] = "mlapo_k_before_producer_single_q_handoff_v2"
+        prefetch_config = getattr(get_ascend_config(), "weight_prefetch_config", None)
+        if prefetch_config is not None and prefetch_config.enabled:
+            factors["weight_prefetch_config"] = (
+                True,
+                prefetch_config.wd_qkv_max_prefetch_bytes,
+                prefetch_config.wu_q_max_prefetch_bytes,
+                prefetch_config.w_uk_t_max_prefetch_bytes,
+                prefetch_config.o_proj_max_prefetch_bytes,
+                prefetch_config.mtp_rot_max_prefetch_bytes,
+            )
+            if prefetch_config.o_proj_max_prefetch_bytes > 0:
+                # Distinguish the former input-quantization schedule in cached graphs.
+                factors["o_proj_prefetch_stage"] = "before_v_up_projection_v2"
+            if prefetch_config.mtp_rot_max_prefetch_bytes > 0:
+                factors["mtp_rot_prefetch_stage"] = "draft_logits_before_sampling_eager_v1"
         logger.info("AscendCompiler hash factors: %s", factors)
         return sha256(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]
 

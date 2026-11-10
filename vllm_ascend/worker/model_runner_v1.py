@@ -3729,6 +3729,18 @@ class NPUModelRunner(GPUModelRunner):
 
         get_offloader().post_init()
 
+        prefetch_config = getattr(self.ascend_config, "weight_prefetch_config", None)
+        if prefetch_config is not None and prefetch_config.enabled:
+            # Bind transformed Direct weights before any graph warmup/capture.
+            from vllm_ascend.weight_prefetch import bind_direct_weight_prefetch, bind_mtp_rot_weight_prefetch
+
+            self.direct_weight_prefetch_plans = bind_direct_weight_prefetch(
+                self.model, self.vllm_config, prefetch_config
+            )
+            self.mtp_rot_weight_prefetch_plan = bind_mtp_rot_weight_prefetch(
+                self.drafter, self.vllm_config, prefetch_config
+            )
+
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())

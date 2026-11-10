@@ -1401,6 +1401,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             multi_steps_attn_metadata.append(per_layer_attn_metadata)
         return None
 
+    def _compute_draft_logits(
+        self, hidden_states: torch.Tensor, *, has_next_draft: bool = False, is_prefill: bool | None = None
+    ):
+        logits = self.model.compute_logits(hidden_states)
+        # Submit before sampling, LMHead row alignment and next-step inputs.
+        # The plan is bound only to the eager GLM MTP path after weight loading.
+        rot_prefetch = getattr(self, "_mtp_rot_weight_prefetch", None)
+        if rot_prefetch is not None and self.method == "mtp":
+            rot_prefetch.submit(
+                logits, has_next_draft=has_next_draft and not self.parallel_drafting, is_prefill=is_prefill
+            )
+        return logits
+
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
         if self.method in ("eagle3", "dflash", "dspark"):
             logits = self.model.logits_processor(self.model.lm_head, hidden_states)
@@ -1518,7 +1531,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             window_events[0].record()
         if get_ascend_config().enable_reduce_sample:
             if self.method in ("eagle3", "dflash", "mtp"):
-                draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
+                if self.method == "mtp" and getattr(self, "_mtp_rot_weight_prefetch", None) is not None:
+                    draft_token_ids = greedy_sample(
+                        self._compute_draft_logits(
+                            sample_hidden_states,
+                            has_next_draft=self.num_speculative_tokens > 1,
+                            is_prefill=is_prefill,
+                        )
+                    )
+                else:
+                    draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
                 if lmhead_tp_enable():
                     draft_token_ids, token_indices_to_sample = self._align_tensor_and_indices(
                         draft_token_ids,
@@ -1568,7 +1590,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         logits[:, idx].add_(logits_bias)
                         draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
             else:
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = self._compute_draft_logits(
+                    sample_hidden_states, has_next_draft=self.num_speculative_tokens > 1, is_prefill=is_prefill
+                )
                 if lmhead_tp_enable():
                     logits, token_indices_to_sample = self._align_tensor_and_indices(
                         logits,
@@ -1711,7 +1735,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 window_events[draft_index + 1].record()
             if get_ascend_config().enable_reduce_sample:
                 if self.method in ("eagle3", "dflash", "dspark", "mtp"):
-                    draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
+                    if self.method == "mtp" and getattr(self, "_mtp_rot_weight_prefetch", None) is not None:
+                        draft_token_ids = greedy_sample(
+                            self._compute_draft_logits(
+                                sample_hidden_states,
+                                has_next_draft=draft_index + 2 < self.num_speculative_tokens,
+                                is_prefill=is_prefill,
+                            )
+                        )
+                    else:
+                        draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
                     if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
                         draft_token_ids = draft_token_ids[:num_indices]
                         token_indices_to_sample = token_indices_to_sample[:num_indices]
@@ -1726,7 +1759,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         token_indices_to_sample = token_indices_to_sample[:num_indices]
                     draft_token_ids = logits.argmax(dim=-1)
             else:
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = self._compute_draft_logits(
+                    sample_hidden_states,
+                    has_next_draft=draft_index + 2 < self.num_speculative_tokens,
+                    is_prefill=is_prefill,
+                )
                 if lmhead_tp_enable() and num_indices < logits.shape[0]:
                     logits = logits[:num_indices]
                     token_indices_to_sample = token_indices_to_sample[:num_indices]

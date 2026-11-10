@@ -215,6 +215,29 @@ handoff. With the switch off, the original K-before-MLAPO order is retained.
 PROLOG scheduling is unchanged. Measure the complete model: these windows
 do not guarantee an ITL improvement.
 
+### Experimental GLM weight prefetch
+
+`weight_prefetch_config` in `--additional-config` enables the imported GLM
+Decode/MTP weight-prefetch paths. It defaults to `{"enabled": false}`.
+The byte limits are independent:
+
+| Option | Default bytes | Prefetch window |
+| --- | ---: | --- |
+| `wd_qkv_max_prefetch_bytes` | 16777216 | Previous layer's shared-expert computation |
+| `wu_q_max_prefetch_bytes` | 0 | Same window as `wd_qkv` |
+| `w_uk_t_max_prefetch_bytes` | 0 | Same window as `wd_qkv` |
+| `o_proj_max_prefetch_bytes` | 0 | V-up projection and o_proj input quantization |
+| `mtp_rot_max_prefetch_bytes` | 0 | Draft logits to the next draft's rotation |
+
+Set `enabled` to `true` and choose the byte limits to test. Direct plans
+require supported GLM Decode offload with shared-expert overlap; MTP rotation
+requires eager sequential single-layer GLM MTP. Binding does not change the
+MTP execution mode. Zero disables an individual window. Measure correctness,
+graph replay and performance on the deployment before enabling these paths.
+The o_proj prefetch starts before V-up and joins after input quantization,
+immediately before GEMM. Measure the complete chain: the longer window can
+hide the prefetch, but its weight reads can also compete with V-up.
+
 ## 4. Use Them Together
 
 The combined data flow is:
