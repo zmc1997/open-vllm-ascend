@@ -79,6 +79,27 @@ class KVDeliveryScheduler(Scheduler):
         )
         self.requires_kv_delivery = bool(self.connector is not None and self.connector.requires_kv_delivery)
 
+    def _limit_local_prefix_cache_hit(
+        self, request: Request, blocks: KVCacheBlocks, local_tokens: int
+    ) -> tuple[KVCacheBlocks, int]:
+        get_limit = getattr(self.connector, "get_local_prefix_cache_limit", None)
+        if get_limit is None:
+            return blocks, local_tokens
+        limit = get_limit(request.request_id)
+        if limit is None or limit >= local_tokens:
+            return blocks, local_tokens
+
+        # These lookup results have not been adopted by the request yet.
+        # Trim the candidates before allocate_slots takes their references.
+        limited_blocks = tuple(
+            group_blocks[: limit // manager.block_size]
+            for group_blocks, manager in zip(
+                blocks.blocks, self.kv_cache_manager.coordinator.single_type_managers, strict=True
+            )
+        )
+        request.shared_prefix_boundary = 0
+        return self.kv_cache_manager.create_kv_cache_blocks(limited_blocks), limit
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -428,6 +449,10 @@ class KVDeliveryScheduler(Scheduler):
                             step_skipped_waiting.prepend_request(request)
                             continue
 
+                        if ext_tokens == 0 and num_new_local_computed_tokens:
+                            new_computed_blocks, num_new_local_computed_tokens = self._limit_local_prefix_cache_hit(
+                                request, new_computed_blocks, num_new_local_computed_tokens
+                            )
                         num_external_computed_tokens = ext_tokens
 
                         connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens
