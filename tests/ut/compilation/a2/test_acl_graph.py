@@ -121,6 +121,7 @@ class TestACLGraphWrapper(TestBase):
         # Mock VllmConfig
         self.mock_vllm_config = MagicMock(spec=VllmConfig)
         self.mock_vllm_config.compilation_config = MagicMock()
+        self.mock_vllm_config.parallel_config = MagicMock(enable_dbo=False)
 
         # Mock runnable function
         self.mock_runnable = MagicMock(return_value="test_output")
@@ -306,8 +307,17 @@ class TestACLGraphWrapper(TestBase):
         # Create a real torch tensor for the test, not a mock
         test_tensor = torch.tensor([1, 2, 3])
 
+        def capture_runnable(*_args):
+            self.assertIsNone(self.mock_forward_context._fsa_lru_plan_common_inputs)
+            self.mock_forward_context._fsa_lru_plan_common_inputs = object()
+            return "test_output"
+
+        self.mock_runnable.side_effect = capture_runnable
+
         # Call the wrapper
-        result = wrapper(test_tensor, "arg2")
+        with patch.object(acl_graph.ascend_envs, "VLLM_ASCEND_FSA_REUSE_LRU_PLAN_INPUTS", True):
+            result = wrapper(test_tensor, "arg2")
+        self.assertFalse(hasattr(self.mock_forward_context, "_fsa_lru_plan_common_inputs"))
 
         # Verify graph capture happened
         mock_validate_cudagraph_capturing_enabled.assert_called_once()
@@ -326,6 +336,16 @@ class TestACLGraphWrapper(TestBase):
 
         # Should return the original output (not weak ref)
         self.assertEqual(result, "test_output")
+
+        def capture_without_reuse(*_args):
+            self.assertFalse(hasattr(self.mock_forward_context, "_fsa_lru_plan_common_inputs"))
+            return "test_output"
+
+        self.mock_runnable.side_effect = capture_without_reuse
+        wrapper.concrete_aclgraph_entries.clear()
+        with patch.object(acl_graph.ascend_envs, "VLLM_ASCEND_FSA_REUSE_LRU_PLAN_INPUTS", False):
+            self.assertEqual(wrapper(test_tensor, "arg2"), "test_output")
+        self.assertFalse(hasattr(self.mock_forward_context, "_fsa_lru_plan_common_inputs"))
 
     @patch("vllm_ascend.compilation.acl_graph.torch")
     @patch("vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled")
