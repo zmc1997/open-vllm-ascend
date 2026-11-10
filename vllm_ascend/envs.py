@@ -41,6 +41,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # scenarios in an environment without an NPU. Do not set it to False in
     # other scenarios.
     "COMPILE_CUSTOM_KERNELS": lambda: bool(int(os.getenv("COMPILE_CUSTOM_KERNELS", "1"))),
+    # Non-sensitive build option. 1 builds the A3 FSA device planner; 0 (default) skips it.
+    "VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER": lambda: bool(int(os.getenv("VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER", "0"))),
     # The CXX compiler used for compiling the package. If not set, the default
     # value is None, which means the system default CXX compiler will be used.
     "CXX_COMPILER": lambda: os.getenv("CXX_COMPILER", None),

@@ -22,6 +22,7 @@ import logging
 import os
 import subprocess
 import sys
+from pathlib import Path
 from sysconfig import get_paths
 
 from setuptools import Command, Extension, find_packages, setup
@@ -133,6 +134,10 @@ def get_chip_type() -> str:
 
 
 envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm_ascend", "envs.py"))
+BUILD_FSA_DEVICE_PLANNER = envs.VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER
+FSA_DEVICE_PLANNER_LIBRARY = "libfsa_mapped_recurrent_planner.so"
+if BUILD_FSA_DEVICE_PLANNER and not envs.COMPILE_CUSTOM_KERNELS:
+    raise RuntimeError("VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER=1 requires COMPILE_CUSTOM_KERNELS=1")
 
 if not envs.SOC_VERSION:
     soc_version = get_chip_type()
@@ -205,8 +210,18 @@ class custom_develop(develop):
         super().run()
 
 
+def remove_disabled_fsa_planner(build_lib: str) -> None:
+    if BUILD_FSA_DEVICE_PLANNER:
+        return
+    # The source package is used by editable installs. A reused build_lib
+    # can also still contain the output of an earlier enabled build.
+    for root in (ROOT_DIR, build_lib):
+        (Path(root) / "vllm_ascend" / FSA_DEVICE_PLANNER_LIBRARY).unlink(missing_ok=True)
+
+
 class custom_build_info(build_py):
     def run(self):
+        remove_disabled_fsa_planner(self.build_lib)
         gen_build_info()
         super().run()
 
@@ -323,6 +338,7 @@ class cmake_build_ext(build_ext):
         }
         CANN_SOC_VERSION = soc_version_map.get(envs.SOC_VERSION, envs.SOC_VERSION)
         cmake_args += [f"-DSOC_VERSION={CANN_SOC_VERSION}"]
+        cmake_args += [f"-DVLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER={'ON' if BUILD_FSA_DEVICE_PLANNER else 'OFF'}"]
 
         # Override the base directory for FetchContent downloads to $ROOT/.deps
         # This allows sharing dependencies between profiles,
@@ -420,6 +436,8 @@ class cmake_build_ext(build_ext):
             for root, _, files in os.walk(self.build_temp):
                 for file in files:
                     if file.endswith(".so"):
+                        if file == FSA_DEVICE_PLANNER_LIBRARY and not BUILD_FSA_DEVICE_PLANNER:
+                            continue
                         src_path = os.path.join(root, file)
                         dst_path = os.path.join(self.build_lib, "vllm_ascend", file)
                         shutil.copy(src_path, dst_path)
@@ -437,6 +455,7 @@ class cmake_build_ext(build_ext):
             print(f"Copy: {src_cann_ops_custom} -> {dst_cann_ops_custom}")
 
     def run(self):
+        remove_disabled_fsa_planner(self.build_lib)
         if envs.COMPILE_CUSTOM_KERNELS:
             # First, ensure ACLNN custom-ops is built and installed.
             self.run_command("build_aclnn")

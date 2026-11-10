@@ -310,6 +310,25 @@ examples and NPU-specific tests when no device is available.
     - Atlas inference products: `export SOC_VERSION=ascend310p1`
     - Atlas 950DT: `export SOC_VERSION=ascend950dt_9582`
 
+The A3 FSA device planner can be built alongside the custom operators. Use an
+A3 build environment with BiSheng from the target CANN toolkit. This planner
+has been validated with CANN 9.1.0 and the `dav-2201` target.
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export SOC_VERSION=ascend910_9391
+export COMPILE_CUSTOM_KERNELS=1
+export VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER=1
+python -m pip wheel --no-build-isolation --no-deps .
+```
+
+For an editable install, use `python -m pip install --no-build-isolation -e .`
+with the same build environment. Both builds place
+`libfsa_mapped_recurrent_planner.so` in the `vllm_ascend` package. The build
+option defaults to off. To enable the planner at runtime, set
+`VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY` to the absolute path of the installed
+library in the supported Decode configuration.
+
 !!! note
 
     To enable the batch invariance feature, set `VLLM_BATCH_INVARIANT=1` before building vllm-ascend to install the batch invariance custom operator library during the installation process.
