@@ -206,12 +206,39 @@ def _split_host_device_kv_specs(
     return host_specs, device_specs
 
 
+def fsa_plan_payload_words(topk: int) -> int:
+    return cdiv((topk + 16) * 2, 32) * 8 + 8
+
+
+def fsa_plan_ipc_bytes(vllm_config, sparse_config, tp_size: int) -> int:
+    if not (
+        envs.VLLM_ASCEND_FSA_PLAN_IPC
+        and envs.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY
+        and sparse_config.use_fused_overlap
+        and tp_size > 1
+    ):
+        return 0
+    decode_width = 1
+    if vllm_config.speculative_config is not None:
+        decode_width += vllm_config.speculative_config.num_speculative_tokens
+    scheduler = vllm_config.scheduler_config
+    rows = min(scheduler.max_num_batched_tokens, scheduler.max_num_seqs * decode_width)
+    return rows * fsa_plan_payload_words(sparse_config.topk) * torch.int32.itemsize
+
+
+def fsa_plan_ipc_reserve_bytes(payload_bytes: int) -> int:
+    if payload_bytes == 0:
+        return 0
+    return (1 + cdiv(payload_bytes, _CPU_CACHE_ALIGNMENT)) * _CPU_CACHE_ALIGNMENT
+
+
 def plan_sparse_kv_offload_memory(
     kv_cache_spec: dict[str, KVCacheSpec],
     vllm_config: VllmConfig,
     available_device_memory_bytes: int,
     dram_limit_bytes: int,
     keep_device_kv_cache: bool,
+    planner_ipc_reserve_bytes: int = 0,
 ) -> SparseKVOffloadMemoryBudget:
     """Bound sparse KV offload blocks by NPU, DRAM, and active demand."""
     host_specs, device_specs = _split_host_device_kv_specs(kv_cache_spec)
@@ -220,7 +247,7 @@ def plan_sparse_kv_offload_memory(
     total_page_size_bytes = host_page_size_bytes + device_page_size_bytes
 
     host_alignment_reserve_bytes = len(host_specs) * _CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER
-    usable_dram_bytes = max(dram_limit_bytes - host_alignment_reserve_bytes, 0)
+    usable_dram_bytes = max(dram_limit_bytes - host_alignment_reserve_bytes - planner_ipc_reserve_bytes, 0)
     dram_limit_blocks = usable_dram_bytes // host_page_size_bytes
 
     npu_page_size_bytes = total_page_size_bytes if keep_device_kv_cache else device_page_size_bytes
@@ -499,11 +526,20 @@ class SparseKVOffloadManager:
             pin_memory=True,
         )
         self._npu_runtime = torch_npu.npu
+        self._fsa_plan_ipc = None
+        self._fsa_plan_ipc_prepared = self._preflight_fsa_plan_ipc()
+        self._fsa_plan_ipc_bytes = (
+            self.max_num_topk_rows * fsa_plan_payload_words(self.topk) * torch.int32.itemsize
+            if self._fsa_plan_ipc_prepared is not None else 0
+        )
 
         self._build_cpp()
 
         dram_limit_bytes = int(sparse_kv_offload_config.dram_size_per_dp_GB * (1 << 30))
-        planned_pool_size_bytes = get_sparse_kv_offload_cpu_pool_size_bytes(kv_cache_config)
+        planned_pool_size_bytes = (
+            get_sparse_kv_offload_cpu_pool_size_bytes(kv_cache_config)
+            + fsa_plan_ipc_reserve_bytes(self._fsa_plan_ipc_bytes)
+        )
         if planned_pool_size_bytes > dram_limit_bytes:
             raise ValueError(
                 "Sparse KV offload planned CPU pool exceeds DRAM limit after "
@@ -1156,10 +1192,47 @@ class SparseKVOffloadManager:
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
         self.lru_physical_row_workspace_ptr = self.lru_physical_row_workspace.data_ptr()
 
-    def _init_fused_device_planner(self, device: torch.device) -> None:
-        library_path = envs.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY
-        if not library_path:
-            return
+    def _preflight_fsa_plan_ipc(self) -> ctypes.CDLL | None:
+        if self.tp_size == 1:
+            return None
+        requested = self.use_fused_overlap and envs.VLLM_ASCEND_FSA_PLAN_IPC
+        boot_id = geometry = failure = library = None
+        if requested:
+            try:
+                library_path = envs.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY
+                if not library_path:
+                    raise ValueError("FSA planner IPC requires VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY")
+                device = torch.device("npu", torch_npu.npu.current_device())
+                library = self._load_fused_device_planner(device, library_path)
+                with contextlib.suppress(OSError, UnicodeError):
+                    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as boot_file:
+                        boot_id = boot_file.read().strip() or None
+                geometry = (self.topk, self.topk_buffer_size, self.max_num_topk_rows, self.max_model_len)
+            except Exception as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+        # Every rank participates, including ranks where the option is off.
+        # Reject partial admission before any rank initializes shared memory or Notify.
+        reports = [None] * self.tp_size
+        torch.distributed.all_gather_object(
+            reports, (requested, boot_id, geometry, failure), group=self.tp_group.cpu_group
+        )
+        if not any(report[0] for report in reports):
+            return None
+        errors = [
+            f"TP{rank}: {report[3] or 'IPC disabled'}"
+            for rank, report in enumerate(reports)
+            if report[3] or not report[0]
+        ]
+        if errors:
+            raise RuntimeError("FSA planner IPC preflight failed: " + "; ".join(errors))
+        known_hosts = {report[1] for report in reports if report[1] is not None}
+        if len(known_hosts) > 1:
+            raise RuntimeError("FSA planner IPC requires a host-local TP group")
+        if len({report[2] for report in reports}) != 1:
+            raise RuntimeError("FSA planner IPC ranks disagree on the FSA wire geometry")
+        return library
+
+    def _load_fused_device_planner(self, device: torch.device, library_path: str) -> ctypes.CDLL:
         if not os.path.isabs(library_path):
             raise ValueError("VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY must be an absolute path")
         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
@@ -1203,11 +1276,31 @@ class SparseKVOffloadManager:
         plan_async.restype = ctypes.c_int
         publish_async.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 3 + [ctypes.c_void_p]
         publish_async.restype = ctypes.c_int
+        return library
+
+    def _init_fused_device_planner(self, device: torch.device) -> None:
+        library = getattr(self, "_fsa_plan_ipc_prepared", None)
+        if library is None:
+            library_path = envs.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY
+            if not library_path:
+                return
+            library = self._load_fused_device_planner(device, library_path)
+        rows = self.max_num_topk_rows
         self.fused_overlap_membership_device = device
         # int16 TopK/control rows, aligned to a DMA block, followed by the
         # int32 current linear slot and padding. Keep the existing FSA wire ABI.
-        payload_words = cdiv((self.topk + 16) * 2, 32) * 8 + 8
-        self.fused_device_planner_payload = torch.empty((rows, payload_words), dtype=torch.int32, device=device)
+        payload_words = fsa_plan_payload_words(self.topk)
+        ipc_bytes = getattr(self, "_fsa_plan_ipc_bytes", 0)
+        if ipc_bytes:
+            if self._fsa_plan_ipc is None:
+                from .fsa_plan_ipc import FsaPlanIpc
+
+                self._fsa_plan_ipc = FsaPlanIpc(
+                    self.tp_group.cpu_group, lambda: empty_aligned_int8_cpu_tensors([ipc_bytes]),
+                    self.fused_plan_stream.npu_stream
+                )
+        else:
+            self.fused_device_planner_payload = torch.empty((rows, payload_words), dtype=torch.int32, device=device)
         if self.tp_rank == 0:
             self.fused_device_planner_mapping = torch.empty(4 * rows, dtype=torch.int32, device=device)
             self.fused_device_planner_input_staging = (
@@ -1641,6 +1734,14 @@ class SparseKVOffloadManager:
         capturing: bool = False,
         skip_topk: bool = False,
     ) -> bool:
+        ipc = getattr(self, "_fsa_plan_ipc", None)
+        if ipc is not None:
+            ipc.ensure_usable()
+            if capturing:
+                context = get_forward_context()
+                if hasattr(context, "_fsa_plan_ipc_join"):
+                    context._fsa_plan_ipc = ipc
+                    context._fsa_plan_ipc_join = self._join_fsa_plan_ipc
         self._validate_fused_overlap_external_plan_inputs(
             num_tokens,
             topk_indices_npu,
@@ -1656,7 +1757,7 @@ class SparseKVOffloadManager:
             plan_start:FSA_SELECTION_MEMBERSHIP_REQUIRER_COLUMNS,
         ]
         encoded_plan_stride = selection_membership_map.stride(0)
-        async_plan = capturing or self.fused_async_plan
+        async_plan = capturing or self.fused_async_plan or ipc is not None
 
         owner_layer_id = self.fused_overlap_plan_owner_layer_id
         owner_map = self.fused_overlap_plan_membership_map
@@ -1753,6 +1854,10 @@ class SparseKVOffloadManager:
         device_planner = self._fused_device_plan_library
         if async_plan or device_planner is not None:
             plan_stream = self.fused_plan_stream if async_plan else torch_npu.npu.current_stream()
+            if device_planner is not None:
+                payload_ptr = (
+                    ipc.payload_ptr if ipc is not None else self.fused_device_planner_payload.data_ptr()
+                )
             if device_planner is not None and self.tp_rank == 0:
                 inputs = (req_ids_npu, topk_indices_npu, stable_prefix_lens_npu, visible_seq_lens_npu)
                 if any(
@@ -1793,7 +1898,7 @@ class SparseKVOffloadManager:
                         result = device_planner.fsa_lru_plan_async_v5(
                             *pointers,
                             self.fused_device_planner_mapping.data_ptr(),
-                            self.fused_device_planner_payload.data_ptr(),
+                            payload_ptr,
                             num_tokens,
                             self.max_num_topk_rows,
                             self.fused_device_planner_vector_cores,
@@ -1805,16 +1910,20 @@ class SparseKVOffloadManager:
                             plan_stream.npu_stream,
                         )
                         if result != 0:
+                            if ipc is not None:
+                                ipc.mark_failed()
                             raise RuntimeError(f"Device FSA planner launch failed for {layer_name}, status {result}")
                     if capturing and self.tp_size > 1:
                         plan_stream.wait_stream(self.current_kv_save_stream)
                 if device_planner is None:
                     self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
                 else:
-                    payload = self.fused_device_planner_payload
-                    self.tp_group.broadcast(payload[:num_tokens], src=0)
+                    if ipc is None:
+                        self.tp_group.broadcast(self.fused_device_planner_payload[:num_tokens], src=0)
+                    else:
+                        ipc.before_publish(plan_stream.npu_stream)
                     result = device_planner.fsa_lru_publish_async_v4(
-                        payload.data_ptr(),
+                        payload_ptr,
                         selection_membership_map.data_ptr(),
                         self.fused_plan_metadata_npu.data_ptr(),
                         num_tokens,
@@ -1823,7 +1932,12 @@ class SparseKVOffloadManager:
                         plan_stream.npu_stream,
                     )
                     if result != 0:
+                        if ipc is not None:
+                            ipc.mark_failed()
                         raise RuntimeError(f"Device FSA plan publish failed for {layer_name}, status {result}")
+                    if ipc is not None:
+                        self._fsa_plan_publish_done = plan_stream.record_event()
+                        ipc.after_publish(plan_stream.npu_stream)
             self.fused_overlap_plan_owner_layer_id = layer_id
             self.fused_overlap_plan_topk = self.topk
             self.fused_overlap_plan_num_tokens = num_tokens
@@ -1930,7 +2044,9 @@ class SparseKVOffloadManager:
         current_kv = self.current_kv_by_layer.get(layer_id)
         if current_kv is None:
             raise RuntimeError(f"current decode K/V is unavailable for fused layer {layer_name}")
-        if capturing or self.fused_async_plan:
+        if getattr(self, "_fsa_plan_ipc", None) is not None:
+            torch_npu.npu.current_stream().wait_event(self._fsa_plan_publish_done)
+        elif capturing or self.fused_async_plan:
             torch_npu.npu.current_stream().wait_stream(self.fused_plan_stream)
 
         current_k, current_rope = current_kv
@@ -1954,6 +2070,35 @@ class SparseKVOffloadManager:
             and layer_id != self.fused_overlap_plan_owner_layer_id
         ):
             self.tp_group.broadcast(self.fused_plan_status_npu, src=0)
+
+    def _join_fsa_plan_ipc(self) -> None:
+        torch_npu.npu.current_stream().wait_stream(self.fused_plan_stream)
+
+    def join_fsa_plan_ipc_if_needed(self, layer_name: str, capturing: bool) -> None:
+        # Eager calls and other capture wrappers do not have a graph-tail join.
+        # Enqueue a dependency after attention, allowing the ACK to overlap it.
+        if (
+            self._fsa_plan_ipc is not None
+            and (not capturing or not hasattr(get_forward_context(), "_fsa_plan_ipc_join"))
+            and self._get_offload_layer_id(layer_name) == self.fused_overlap_plan_owner_layer_id
+        ):
+            self._join_fsa_plan_ipc()
+
+    def close_fsa_plan_ipc(self, model_runner) -> None:
+        if self._fsa_plan_ipc is None:
+            return
+        from vllm_ascend.device_allocator.sleep_mem_optimized import AclGraphSleepWakeupManager
+
+        # Worker shutdown has stopped submissions. Mark existing captures unusable
+        # before draining: a failed drain must retain the payload and Notify handles.
+        self._fsa_plan_ipc.mark_failed()
+        # No cross-rank barrier here: teardown can follow a failed peer.
+        torch_npu.npu.synchronize(self.fused_overlap_membership_device)
+        AclGraphSleepWakeupManager.clear_all_attention_workspaces()
+        AclGraphSleepWakeupManager.reset_all_graph_params()
+        AclGraphSleepWakeupManager.reset_model_runner_graph_manager(model_runner)
+        self._fsa_plan_ipc.close()
+        # Keep the closed holder so a later accidental submission is rejected.
 
     def wait_for_current_kv_writeback(self, capturing: bool = False) -> None:
         if self.use_fused_overlap and capturing and self.tp_rank == 0:

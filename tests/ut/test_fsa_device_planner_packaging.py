@@ -94,6 +94,27 @@ class TestFsaDevicePlannerPackaging(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, name):
                 _ = envs.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY
 
+    def test_notify_mode_uses_the_packaged_library_and_respects_explicit_mode(self):
+        spec = importlib.util.spec_from_file_location("planner_envs", ROOT / "vllm_ascend" / "envs.py")
+        envs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(envs)
+        with patch.dict(os.environ, {"VLLM_ASCEND_FSA_PLANNER_MODE": "notify"}, clear=True):
+            self.assertTrue(envs.VLLM_ASCEND_FSA_PLAN_IPC)
+            self.assertEqual(
+                Path(envs.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY),
+                ROOT / "vllm_ascend" / "libfsa_mapped_recurrent_planner.so",
+            )
+            os.environ["VLLM_ASCEND_FSA_PLAN_IPC"] = "1"
+            os.environ["VLLM_ASCEND_FSA_PLANNER_MODE"] = "hccl"
+            self.assertFalse(envs.VLLM_ASCEND_FSA_PLAN_IPC)
+            os.environ["VLLM_ASCEND_FSA_PLANNER_MODE"] = "cpu"
+            self.assertFalse(envs.VLLM_ASCEND_FSA_PLAN_IPC)
+            self.assertIsNone(envs.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY)
+            del os.environ["VLLM_ASCEND_FSA_PLANNER_MODE"]
+            self.assertTrue(envs.VLLM_ASCEND_FSA_PLAN_IPC)
+            os.environ["VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY"] = str(ROOT / "override.so")
+            self.assertEqual(envs.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY, str(ROOT / "override.so"))
+
     def test_rebuilding_only_keeps_planner_when_enabled(self):
         for command_name, compile_kernels in (("custom_build_info", False), ("cmake_build_ext", True)):
             for planner_enabled in ((False, True) if compile_kernels else (False,)):

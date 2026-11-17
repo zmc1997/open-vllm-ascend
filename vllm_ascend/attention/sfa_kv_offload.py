@@ -1164,16 +1164,25 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         }
         if split_query:
             fused_inputs["query_rope"] = q_pe_decode
-        manager.inject_current_kv_into_selection(
-            layer_name=layer_name,
-            num_tokens=num_tokens,
-            selection_kv_cache=selection_kv_cache,
-            selection_k_rope=selection_k_rope,
-            capturing=get_forward_context().capturing,
-        )
-        attn_output = fused_op(**fused_inputs)
-        attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
-        manager.wait_for_current_kv_writeback(get_forward_context().capturing)
+        try:
+            manager.inject_current_kv_into_selection(
+                layer_name=layer_name,
+                num_tokens=num_tokens,
+                selection_kv_cache=selection_kv_cache,
+                selection_k_rope=selection_k_rope,
+                capturing=get_forward_context().capturing,
+            )
+            attn_output = fused_op(**fused_inputs)
+            attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
+            capturing = get_forward_context().capturing
+            manager.wait_for_current_kv_writeback(capturing)
+            if envs_ascend.VLLM_ASCEND_FSA_PLAN_IPC:
+                manager.join_fsa_plan_ipc_if_needed(layer_name, capturing)
+        except BaseException:
+            ipc = getattr(manager, "_fsa_plan_ipc", None)
+            if ipc is not None:
+                ipc.mark_failed()
+            raise
         return attn_output
 
     def _execute_sparse_flash_attention_process(

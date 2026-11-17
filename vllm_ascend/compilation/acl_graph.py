@@ -52,6 +52,7 @@ class ACLGraphEntry:
     batch_descriptor: BatchDescriptor
     aclgraph: torch.npu.NPUGraph | None = None
     output: Any | None = None
+    fsa_plan_ipc: Any | None = None
 
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
@@ -166,6 +167,9 @@ class ACLGraphWrapper:
             aclgraph = torch.npu.NPUGraph()
 
             with ExitStack() as stack:
+                if ascend_envs.VLLM_ASCEND_FSA_PLAN_IPC:
+                    stack.enter_context(patch.object(forward_context, "_fsa_plan_ipc_join", None, create=True))
+                    stack.enter_context(patch.object(forward_context, "_fsa_plan_ipc", None, create=True))
                 if (
                     ascend_envs.VLLM_ASCEND_FSA_REUSE_LRU_PLAN_INPUTS
                     and self.runtime_mode == CUDAGraphMode.FULL
@@ -214,6 +218,10 @@ class ACLGraphWrapper:
                         # forks copy_stream, but wait_prefetch only happens in
                         # the next forward pass.
                         get_offloader().join_after_forward()
+                        join_fsa_plan = getattr(forward_context, "_fsa_plan_ipc_join", None)
+                        if join_fsa_plan is not None:
+                            join_fsa_plan()
+                        entry.fsa_plan_ipc = getattr(forward_context, "_fsa_plan_ipc", None)
                         if self.aclgraph_options.weak_ref_output:
                             # by converting it to weak ref,
                             # the original `output` will immediately be released
@@ -222,7 +230,12 @@ class ACLGraphWrapper:
                             # the output of the last graph will not be used by
                             # any other acl graph.
                             output = weak_ref_tensors(output)
-                except RuntimeError as exc:
+                except BaseException as exc:
+                    ipc = getattr(forward_context, "_fsa_plan_ipc", None)
+                    if ipc is not None:
+                        ipc.mark_failed()
+                    if not isinstance(exc, RuntimeError):
+                        raise
                     if _is_old_hdk_capture_error(exc):
                         raise RuntimeError(
                             "ACL graph capture failed with an old Ascend HDK/CANN stack "
@@ -280,9 +293,16 @@ class ACLGraphWrapper:
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
-        if not self.enable_enpu and need_sync:
-            torch.npu.current_stream().synchronize()
-        entry.aclgraph.replay()
+        if entry.fsa_plan_ipc is not None:
+            entry.fsa_plan_ipc.ensure_usable()
+        try:
+            if not self.enable_enpu and need_sync:
+                torch.npu.current_stream().synchronize()
+            entry.aclgraph.replay()
+        except BaseException:
+            if entry.fsa_plan_ipc is not None:
+                entry.fsa_plan_ipc.mark_failed()
+            raise
         return entry.output
 
 

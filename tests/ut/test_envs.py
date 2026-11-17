@@ -46,7 +46,7 @@ class TestEnvVariables(TestBase):
 
                     handler_source = inspect.getsource(var_handler)
                     if var_name == "VLLM_ASCEND_FSA_PLANNER_MODE":
-                        test_vals = ["cpu", "hccl"]
+                        test_vals = ["cpu", "hccl", "notify"]
                     elif "int(" in handler_source:
                         test_vals = ["123", "456"]
                     elif "bool(int(" in handler_source:

@@ -29,10 +29,12 @@ FSA_DEVICE_PLANNER_LIBRARY_NAME = "libfsa_mapped_recurrent_planner.so"
 def _fsa_planner_mode() -> str:
     mode = os.getenv("VLLM_ASCEND_FSA_PLANNER_MODE")
     if mode is None:
-        # Keep existing deployments that explicitly select a planner library.
+        # Keep existing deployments that explicitly configure the transport or library.
+        if os.getenv("VLLM_ASCEND_FSA_PLAN_IPC") == "1":
+            return "notify"
         return "hccl" if os.getenv("VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY") else "cpu"
-    if mode not in ("cpu", "hccl"):
-        raise ValueError("VLLM_ASCEND_FSA_PLANNER_MODE must be cpu or hccl")
+    if mode not in ("cpu", "hccl", "notify"):
+        raise ValueError("VLLM_ASCEND_FSA_PLANNER_MODE must be cpu, hccl or notify")
     return mode
 
 
@@ -132,10 +134,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Non-sensitive FSA scheduling: 1 (default) enables the dynamic planner stream; 0 disables it.
     "VLLM_ASCEND_FSA_ASYNC_PLAN": lambda: bool(int(os.getenv("VLLM_ASCEND_FSA_ASYNC_PLAN", "1"))),
-    # Non-sensitive FSA Decode planner selection: cpu (default) or hccl (A3 NPU planner).
+    # Non-sensitive FSA Decode planner selection: cpu (default), hccl or notify.
     "VLLM_ASCEND_FSA_PLANNER_MODE": _fsa_planner_mode,
     # Non-sensitive optional absolute path override; defaults to the installed package library in NPU mode.
     "VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY": _fsa_planner_library,
+    # Legacy Notify flag; the effective value follows the planner mode.
+    "VLLM_ASCEND_FSA_PLAN_IPC": lambda: _fsa_planner_mode() == "notify",
     # Non-sensitive FSA layout reuse within a graph capture: 1 (default); 0 disables it.
     "VLLM_ASCEND_FSA_REUSE_WRITEBACK_LAYOUT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FSA_REUSE_WRITEBACK_LAYOUT", "1"))

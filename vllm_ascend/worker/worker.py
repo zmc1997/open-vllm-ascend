@@ -68,6 +68,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     get_layerwise_physical_layer_index,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+    fsa_plan_ipc_bytes,
+    fsa_plan_ipc_reserve_bytes,
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
@@ -374,6 +376,8 @@ class NPUWorker(WorkerBase):
             weight_transfer_engine.shutdown()
 
         if model_runner := getattr(self, "model_runner", None):
+            if manager := getattr(model_runner, "sparse_kv_offload_manager", None):
+                manager.close_fsa_plan_ipc(model_runner)
             shutdown_fn = getattr(model_runner, "shutdown", None)
             if callable(shutdown_fn):
                 shutdown_fn()
@@ -518,12 +522,17 @@ class NPUWorker(WorkerBase):
 
         kv_cache_spec = getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec()
         dram_limit_bytes = int(sparse_kv_offload_config.dram_size_per_dp_GB * GiB_bytes)
+        ipc_reserve = fsa_plan_ipc_reserve_bytes(
+            fsa_plan_ipc_bytes(self.vllm_config, sparse_kv_offload_config, self.parallel_config.tensor_parallel_size)
+        )
+        ipc_options = {"planner_ipc_reserve_bytes": ipc_reserve} if ipc_reserve else {}
         budget = plan_sparse_kv_offload_memory(
             kv_cache_spec=kv_cache_spec,
             vllm_config=self.vllm_config,
             available_device_memory_bytes=available_device_memory_bytes,
             dram_limit_bytes=dram_limit_bytes,
             keep_device_kv_cache=sparse_kv_offload_config.keep_device_kv_cache,
+            **ipc_options,
         )
         logger.info_once(
             "Sparse KV offload memory plan: npu_limit=%d blocks, "

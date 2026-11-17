@@ -108,11 +108,16 @@ def load_manager():
         "_register_offload_layers",
         "register_kv_caches",
         "_initialize_cpu_lru_planner",
+        "_preflight_fsa_plan_ipc",
+        "_load_fused_device_planner",
         "_init_fused_device_planner",
         "_get_fused_device_planner_layer_state",
         "allocate_fused_overlap_membership_map",
         "prepare_fused_overlap_external_plan",
         "_validate_fused_overlap_external_plan_inputs",
+        "_join_fsa_plan_ipc",
+        "join_fsa_plan_ipc_if_needed",
+        "close_fsa_plan_ipc",
     }
     constants = [
         n
@@ -132,6 +137,7 @@ def load_manager():
             body=[
                 ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
                 *constants,
+                *(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "fsa_plan_payload_words"),
                 cls,
             ],
             type_ignores=[],
@@ -173,6 +179,139 @@ def library_environment(library, cores=48, ub=192 * 1024):
 
 
 class TestFSAPlannerRuntime(unittest.TestCase):
+    def test_failed_ipc_rejects_new_work_before_accessing_inputs(self):
+        manager, _ = load_manager()
+        ipc = manager._fsa_plan_ipc = Mock()
+        ipc.ensure_usable.side_effect = RuntimeError("transport failed")
+        with self.assertRaisesRegex(RuntimeError, "transport failed"):
+            manager.prepare_fused_overlap_external_plan("0", 1, None, None, None, None, None)
+        ipc.ensure_usable.assert_called_once()
+        manager.tp_group.broadcast.assert_not_called()
+
+    def test_ipc_close_keeps_resources_until_drain_and_graph_retirement(self):
+        for fail_stage in (None, "drain", "clear_graph_params", "destroy"):
+            with self.subTest(fail_stage=fail_stage):
+                manager, ns = load_manager()
+                actions = []
+
+                def action(name):
+                    def run(*_):
+                        actions.append(name)
+                        if name == fail_stage:
+                            raise RuntimeError(name)
+                    return run
+
+                ipc = manager._fsa_plan_ipc = NS(mark_failed=action("stop"), close=action("destroy"))
+                manager.fused_overlap_membership_device = "npu:0"
+                ns["torch_npu"].npu.synchronize = action("drain")
+                cleanup = NS(
+                    clear_all_attention_workspaces=action("clear_workspaces"),
+                    reset_all_graph_params=action("clear_graph_params"),
+                    reset_model_runner_graph_manager=action("clear_graphs"),
+                )
+                with patch.dict("sys.modules", {
+                    "vllm_ascend.device_allocator.sleep_mem_optimized": NS(AclGraphSleepWakeupManager=cleanup),
+                }):
+                    if fail_stage:
+                        with self.assertRaisesRegex(RuntimeError, fail_stage):
+                            manager.close_fsa_plan_ipc(object())
+                    else:
+                        manager.close_fsa_plan_ipc(object())
+                expected = ["stop", "drain", "clear_workspaces", "clear_graph_params", "clear_graphs", "destroy"]
+                if fail_stage:
+                    expected = expected[:expected.index(fail_stage) + 1]
+                self.assertEqual(actions, expected)
+                self.assertIs(manager._fsa_plan_ipc, ipc)
+
+    def test_ipc_eager_ack_join_is_device_dependency_not_host_sync(self):
+        manager, ns = load_manager()
+        manager._fsa_plan_ipc = object()
+        manager.fused_overlap_plan_owner_layer_id = 0
+        manager.fused_plan_stream = object()
+        current = Mock()
+        ns["torch_npu"].npu.current_stream = Mock(return_value=current)
+        ns["get_forward_context"] = Mock(return_value=NS(_fsa_plan_ipc_join=None))
+        manager.join_fsa_plan_ipc_if_needed("0", capturing=False)
+        current.wait_stream.assert_called_once_with(manager.fused_plan_stream)
+        ns["torch_npu"].npu.synchronize.assert_not_called()
+        current.synchronize.assert_not_called()
+        current.reset_mock()
+        manager.join_fsa_plan_ipc_if_needed("1", capturing=False)
+        current.wait_stream.assert_not_called()
+        manager.join_fsa_plan_ipc_if_needed("0", capturing=True)
+        current.wait_stream.assert_not_called()
+        ns["get_forward_context"].return_value = NS()
+        manager.join_fsa_plan_ipc_if_needed("0", capturing=True)
+        current.wait_stream.assert_called_once_with(manager.fused_plan_stream)
+
+    def test_ipc_preflight_consensus_rejects_partial_admission(self):
+        cases = (
+            (("off", "off"), None),
+            (("on", "off"), "TP1: IPC disabled"),
+            (("bad-library", "on"), "TP0: OSError: invalid ELF"),
+            (("on", "missing-library"), "TP1: ValueError: FSA planner IPC requires"),
+            (("on", "other-host"), "host-local TP group"),
+            (("on", "different-geometry"), "wire geometry"),
+            (("on", "hidden-boot-id"), "admitted"),
+            (("on", "on"), "admitted"),
+        )
+        for modes, verdict in cases:
+            for rank in (0, 1):
+                with self.subTest(modes=modes, rank=rank):
+                    manager, ns = load_manager()
+                    ns["contextlib"] = contextlib
+                    env, torch = ns["envs"], ns["torch"]
+                    mode = modes[rank]
+                    env.VLLM_ASCEND_FSA_PLAN_IPC = mode != "off"
+                    if mode == "missing-library":
+                        env.VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY = None
+                    expected_library = object()
+                    loader = Mock(return_value=expected_library)
+                    if mode == "bad-library":
+                        loader.side_effect = OSError("invalid ELF")
+                    if mode == "different-geometry":
+                        manager.topk += 1
+                    manager._load_fused_device_planner = loader
+                    manager.tp_group.cpu_group = object()
+                    ns["torch_npu"].npu.current_device = Mock(return_value=rank)
+                    torch.device = Mock(return_value=NS(index=rank))
+                    ns["open"] = Mock()
+                    ns["open"].return_value.__enter__ = Mock(
+                        return_value=NS(read=lambda: "b" if mode == "other-host" else "a")
+                    )
+                    ns["open"].return_value.__exit__ = Mock(return_value=False)
+                    if mode == "hidden-boot-id":
+                        ns["open"].side_effect = PermissionError("boot ID is hidden")
+                    geometry = (7, 128, 3, 2 << 20)
+                    packets = {
+                        "off": (False, None, None, None),
+                        "on": (True, "a", geometry, None),
+                        "bad-library": (True, None, None, "OSError: invalid ELF"),
+                        "missing-library": (
+                            True, None, None,
+                            "ValueError: FSA planner IPC requires VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY",
+                        ),
+                        "other-host": (True, "b", geometry, None),
+                        "different-geometry": (True, "a", (8, *geometry[1:]), None),
+                        "hidden-boot-id": (True, None, geometry, None),
+                    }
+
+                    def exchange(reports, packet, group):
+                        self.assertIs(group, manager.tp_group.cpu_group)
+                        self.assertEqual(packet, packets[mode])
+                        reports[:] = [packets[name] for name in modes]
+
+                    torch.distributed = NS(all_gather_object=Mock(side_effect=exchange))
+                    if verdict == "admitted":
+                        self.assertIs(manager._preflight_fsa_plan_ipc(), expected_library)
+                    elif verdict is None:
+                        self.assertIsNone(manager._preflight_fsa_plan_ipc())
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, verdict):
+                            manager._preflight_fsa_plan_ipc()
+                    torch.distributed.all_gather_object.assert_called_once()
+                    self.assertEqual(loader.call_count, int(mode not in ("off", "missing-library")))
+
     def test_actual_dimensions_and_resources_are_forwarded_without_deployment_gates(self):
         cases = (
             (1, 128, 1, 4096, 1, 24, 64 * 1024),

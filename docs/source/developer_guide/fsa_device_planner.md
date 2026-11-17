@@ -13,11 +13,13 @@ Set `VLLM_ASCEND_FSA_PLANNER_MODE` consistently on the fused-overlap Decode work
 | --- | --- |
 | `cpu` (default) | CPU LRU planning and the existing TP broadcast |
 | `hccl` | A3 NPU planning and HCCL broadcast |
+| `notify` | A3 NPU planning and shared DDR with native notifications for a host-local TP group |
 
 NPU mode loads the planner library from the installed `vllm_ascend` package.
 A missing or incompatible library fails at initialization. Existing launch
 scripts can still specify an absolute `VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY`
-override. When no mode is set, that override selects `hccl`.
+override. When no mode is set, the legacy `VLLM_ASCEND_FSA_PLAN_IPC=1`
+selects `notify`. Otherwise, an explicit library override selects `hccl`.
 
 The planner derives TopK width, selection-cache capacity, maximum simultaneous
 rows and maximum token position from the existing model/cache configuration.
