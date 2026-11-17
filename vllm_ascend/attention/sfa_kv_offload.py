@@ -504,6 +504,13 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             manager = get_sparse_kv_offload_manager()
             layer_name = self._offload_layer_name()
             k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
+            if self.use_fused_overlap and is_forward_context_available():
+                # Fused attention joins the save stream only during capture.
+                # Outside capture (e.g. a PIECEWISE attention island), write
+                # on the compute stream so plan publication also orders KV.
+                capturing = get_forward_context().capturing
+            else:
+                capturing = self._in_graph_runtime()
             manager.offload_new_kv(
                 layer_name=layer_name,
                 slot_mapping=slots,
@@ -514,7 +521,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 k=k_nope,
                 v=k_pe,
                 has_prefill=False,
-                capturing=self._in_graph_runtime(),
+                capturing=capturing,
             )
             return k_pe, k_nope
 
@@ -1171,6 +1178,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 selection_kv_cache=selection_kv_cache,
                 selection_k_rope=selection_k_rope,
                 capturing=get_forward_context().capturing,
+                multi_token_decode=num_tokens > num_reqs,
             )
             attn_output = fused_op(**fused_inputs)
             attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()

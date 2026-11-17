@@ -2039,6 +2039,8 @@ class SparseKVOffloadManager:
         selection_kv_cache: torch.Tensor,
         selection_k_rope: torch.Tensor,
         capturing: bool = False,
+        *,
+        multi_token_decode: bool = False,
     ) -> None:
         layer_id = self._get_offload_layer_id(layer_name)
         current_kv = self.current_kv_by_layer.get(layer_id)
@@ -2064,8 +2066,10 @@ class SparseKVOffloadManager:
         # completion already covers its CPU stores on this compute stream.
         if self.tp_rank == 0 and capturing and layer_id not in self.producer_writeback_layers:
             torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
+        # A later token can load earlier KV from this layer's shared CPU pool.
+        # Reusing the owner plan skips publication for the current layer.
         if (
-            (capturing or layer_id in self.producer_writeback_layers)
+            (capturing or multi_token_decode or layer_id in self.producer_writeback_layers)
             and self.tp_size > 1
             and layer_id != self.fused_overlap_plan_owner_layer_id
         ):
