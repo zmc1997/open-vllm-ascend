@@ -14,6 +14,7 @@
 
 import inspect
 import os
+from unittest.mock import patch
 
 import vllm_ascend.envs as envs_ascend
 from tests.ut.base import TestBase
@@ -22,6 +23,15 @@ from tests.ut.base import TestBase
 class TestEnvVariables(TestBase):
     def setUp(self):
         self.env_vars = list(envs_ascend.env_variables.keys())
+
+    def test_fsa_device_planner_build_override(self):
+        with patch.dict(os.environ):
+            os.environ.pop("VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER", None)
+            self.assertIsNone(envs_ascend.VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER)
+            os.environ["VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER"] = "0"
+            self.assertFalse(envs_ascend.VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER)
+            os.environ["VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER"] = "1"
+            self.assertTrue(envs_ascend.VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER)
 
     def test_env_vars_behavior(self):
         for var_name in self.env_vars:
@@ -35,7 +45,9 @@ class TestEnvVariables(TestBase):
                     self.assertEqual(getattr(envs_ascend, var_name), var_handler())
 
                     handler_source = inspect.getsource(var_handler)
-                    if "int(" in handler_source:
+                    if var_name == "VLLM_ASCEND_FSA_PLANNER_MODE":
+                        test_vals = ["cpu", "hccl"]
+                    elif "int(" in handler_source:
                         test_vals = ["123", "456"]
                     elif "bool(int(" in handler_source:
                         test_vals = ["0", "1"]

@@ -57,6 +57,14 @@ class ResourceTests(unittest.TestCase):
         nodes = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef))]
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), namespace)
         self.get = namespace["get_device_resources"]
+        self.get_vector = namespace["get_vector_resources"]
+
+    def test_vector_only_uses_ub_without_cube_or_architecture_fields(self):
+        self.files[self.directory / "chip0.ini"] = "[AICoreSpec]\nub_size=196608\n"
+        self.assertEqual(self.get_vector(0), (48, 196608))
+        self.assertEqual(self.get_vector(0), (48, 196608))
+        self.assertEqual(self.properties.call_count, 1)
+        self.assertEqual(self.driver.call_count, 1)
 
     def write_config(self, device, ub, npu_arch=2201):
         self.files[self.directory / f"chip{device}.ini"] = (

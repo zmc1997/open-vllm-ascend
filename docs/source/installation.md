@@ -310,6 +310,17 @@ examples and NPU-specific tests when no device is available.
     - Atlas inference products: `export SOC_VERSION=ascend310p1`
     - Atlas 950DT: `export SOC_VERSION=ascend950dt_9582`
 
+A native build for Atlas A3 includes `libfsa_mapped_recurrent_planner.so` in
+the `vllm_ascend` package. Both wheel and editable installs use BiSheng from the
+target CANN toolkit. The planner has been validated with CANN 9.1.0 and
+`dav-2201`.
+
+A deployment uses CPU planning by default. To select the packaged NPU planner,
+set `VLLM_ASCEND_FSA_PLANNER_MODE=hccl` on the fused-overlap Decode workers.
+The runtime loads the library from the installed package. Rebuild the planner
+with its Python caller. See [FSA device planning and graph
+replay](developer_guide/fsa_device_planner.md) for supported modes and inputs.
+
 !!! note
 
     To enable the batch invariance feature, set `VLLM_BATCH_INVARIANT=1` before building vllm-ascend to install the batch invariance custom operator library during the installation process.

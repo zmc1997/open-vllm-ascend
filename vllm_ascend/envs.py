@@ -20,8 +20,28 @@
 
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
+FSA_DEVICE_PLANNER_LIBRARY_NAME = "libfsa_mapped_recurrent_planner.so"
+
+
+def _fsa_planner_mode() -> str:
+    mode = os.getenv("VLLM_ASCEND_FSA_PLANNER_MODE")
+    if mode is None:
+        # Keep existing deployments that explicitly select a planner library.
+        return "hccl" if os.getenv("VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY") else "cpu"
+    if mode not in ("cpu", "hccl"):
+        raise ValueError("VLLM_ASCEND_FSA_PLANNER_MODE must be cpu or hccl")
+    return mode
+
+
+def _fsa_planner_library() -> str | None:
+    if _fsa_planner_mode() == "cpu":
+        return None
+    return os.getenv("VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY") or str(
+        Path(__file__).resolve().with_name(FSA_DEVICE_PLANNER_LIBRARY_NAME)
+    )
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -41,6 +61,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # scenarios in an environment without an NPU. Do not set it to False in
     # other scenarios.
     "COMPILE_CUSTOM_KERNELS": lambda: bool(int(os.getenv("COMPILE_CUSTOM_KERNELS", "1"))),
+    # Non-sensitive legacy build override: 0 skips and 1 requires the A3 planner.
+    # Unset (default) uses the native build target to decide.
+    "VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER": lambda: (
+        None if "VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER" not in os.environ
+        else bool(int(os.environ["VLLM_ASCEND_BUILD_FSA_DEVICE_PLANNER"]))
+    ),
     # The CXX compiler used for compiling the package. If not set, the default
     # value is None, which means the system default CXX compiler will be used.
     "CXX_COMPILER": lambda: os.getenv("CXX_COMPILER", None),
@@ -106,6 +132,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Non-sensitive FSA scheduling: 1 (default) enables the dynamic planner stream; 0 disables it.
     "VLLM_ASCEND_FSA_ASYNC_PLAN": lambda: bool(int(os.getenv("VLLM_ASCEND_FSA_ASYNC_PLAN", "1"))),
+    # Non-sensitive FSA Decode planner selection: cpu (default) or hccl (A3 NPU planner).
+    "VLLM_ASCEND_FSA_PLANNER_MODE": _fsa_planner_mode,
+    # Non-sensitive optional absolute path override; defaults to the installed package library in NPU mode.
+    "VLLM_ASCEND_FSA_DEVICE_PLANNER_LIBRARY": _fsa_planner_library,
     # Non-sensitive FSA layout reuse within a graph capture: 1 (default); 0 disables it.
     "VLLM_ASCEND_FSA_REUSE_WRITEBACK_LAYOUT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FSA_REUSE_WRITEBACK_LAYOUT", "1"))

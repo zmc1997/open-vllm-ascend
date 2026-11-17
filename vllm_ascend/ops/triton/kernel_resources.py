@@ -30,19 +30,33 @@ class DeviceResources(NamedTuple):
     cache_line_bytes: int
 
 
+def _get_platform_config(device_name: str) -> configparser.ConfigParser:
+    root = Path(envs.ASCEND_HOME_PATH)
+    relative = Path("data/platform_config") / (device_name + ".ini")
+    paths = (root / relative, root / (platform.machine() + "-linux") / relative)
+    path = next((path for path in paths if path.is_file()), None)
+    if path is None:
+        raise RuntimeError(f"CANN platform configuration is required for Triton tiling: {device_name}")
+    config = configparser.ConfigParser()
+    config.read(path)
+    return config
+
+
+@cache
+def get_vector_resources(device_index: int) -> tuple[int, int]:
+    """Return the vector core count and UB bytes used by vector-only kernels."""
+    properties = torch.npu.get_device_properties(device_index)
+    driver_properties = triton.runtime.driver.active.utils.get_device_properties(device_index)
+    config = _get_platform_config(properties.name)
+    return driver_properties["num_vectorcore"], config.getint("AICoreSpec", "ub_size")
+
+
 @cache
 def get_device_resources(device_index: int) -> DeviceResources:
     """Read the target device and CANN platform once, without tensor transfers."""
     properties = torch.npu.get_device_properties(device_index)
     driver_properties = triton.runtime.driver.active.utils.get_device_properties(device_index)
-    root = Path(envs.ASCEND_HOME_PATH)
-    relative = Path("data/platform_config") / (properties.name + ".ini")
-    paths = (root / relative, root / (platform.machine() + "-linux") / relative)
-    path = next((path for path in paths if path.is_file()), None)
-    if path is None:
-        raise RuntimeError(f"CANN platform configuration is required for Triton tiling: {properties.name}")
-    config = configparser.ConfigParser()
-    config.read(path)
+    config = _get_platform_config(properties.name)
     npu_arch = config.getint("version", "NpuArch")
     return DeviceResources(
         vector_cores=driver_properties["num_vectorcore"],
