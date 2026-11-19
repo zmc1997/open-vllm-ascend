@@ -768,6 +768,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # when update. So we can use the shallow copy.
         return copy.copy(attn_metadata)
 
+    def _uses_lmhead_request_padding(self) -> bool:
+        return (
+            self.method == "mtp"
+            and self.dcp_size == 1
+            and not self.parallel_drafting
+            and not self.use_cuda_graph
+            and lmhead_tp_enable()
+        )
+
+    def _sync_draft_metadata(self, num_tokens: int, num_reqs: int):
+        if self._uses_lmhead_request_padding():
+            return self.runner._sync_dp_metadata(num_tokens, is_draft_model=True, lmhead_num_reqs=num_reqs)
+        return (*self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True), None)
+
     @torch.inference_mode()
     def dummy_run(
         self,
@@ -785,7 +799,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_tokens,
             num_tokens_across_dp,
             _,
-        ) = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
+            lmhead_num_reqs,
+        ) = self._sync_draft_metadata(num_tokens, num_reqs)
         dcp_manager = getattr(self.runner, "dcp_manager", None)
 
         multi_steps_attn_metadata = []
@@ -908,6 +923,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         model_positions = self._get_positions(num_tokens)
 
         batch_size = max(num_tokens // (self.num_speculative_tokens + 1), 1)
+        if lmhead_num_reqs is not None:
+            batch_size = min(batch_size, max(1, lmhead_num_reqs))
         # TODO: temporarily hack here, we should find out batch_size for profile_run
         if is_profile:
             batch_size = min(batch_size, self.runner.max_num_reqs)
@@ -943,6 +960,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             forward_context = get_forward_context()
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
+                if lmhead_num_reqs is not None:
+                    forward_context.additional_kwargs["lmhead_draft_num_reqs"] = lmhead_num_reqs
 
             self._runnable(
                 num_input_tokens=num_tokens,
@@ -1097,7 +1116,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_input_tokens,
             num_tokens_across_dp,
             _,
-        ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
+            lmhead_num_reqs,
+        ) = self._sync_draft_metadata(num_input_tokens, max(batch_size, token_indices_to_sample.shape[0]))
 
         if self.use_cuda_graph:
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
@@ -1292,6 +1312,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             forward_context = get_forward_context()
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
+                if lmhead_num_reqs is not None:
+                    forward_context.additional_kwargs["lmhead_draft_num_reqs"] = lmhead_num_reqs
 
             model_inputs: dict[str, Any] = {
                 "num_input_tokens": num_input_tokens,
@@ -1429,8 +1451,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             logits = self.model.compute_logits(hidden_states)
             return greedy_sample(logits)
 
-    def _get_lmhead_pad_size(self, num_input_tokens: int) -> int:
-        pad_size = self.vllm_config.scheduler_config.max_num_seqs * self.runner.uniform_decode_query_len
+    def _get_lmhead_pad_size(self, num_input_tokens: int, lmhead_num_reqs: int | None = None) -> int:
+        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        if lmhead_num_reqs is not None:
+            return min(max_num_seqs, max(1, lmhead_num_reqs))
+        pad_size = max_num_seqs * self.runner.uniform_decode_query_len
         if (
             self.method == "mtp"
             and self.dcp_size == 1
@@ -1455,7 +1480,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         metadata_events=None,
         window_events=None,
     ) -> torch.Tensor:
-        lmhead_pad_size = self._get_lmhead_pad_size(num_input_tokens) if lmhead_tp_enable() else None
+        lmhead_pad_size = None
+        if lmhead_tp_enable():
+            lmhead_num_reqs = get_forward_context().additional_kwargs.get("lmhead_draft_num_reqs")
+            lmhead_pad_size = self._get_lmhead_pad_size(num_input_tokens, lmhead_num_reqs)
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.

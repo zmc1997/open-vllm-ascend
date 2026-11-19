@@ -737,7 +737,27 @@ class NPUModelRunner(GPUModelRunner):
         allow_dp_padding: bool = False,
         *,
         prepare_inputs_during_sync: Callable[[], None] | None = None,
+        lmhead_num_reqs: int | None = None,
     ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
+        return self._sync_dp_metadata(
+            num_tokens,
+            is_draft_model,
+            cudagraph_mode,
+            allow_dp_padding,
+            prepare_inputs_during_sync=prepare_inputs_during_sync,
+            lmhead_num_reqs=lmhead_num_reqs,
+        )[:3]
+
+    def _sync_dp_metadata(
+        self,
+        num_tokens: int,
+        is_draft_model: bool = False,
+        cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        allow_dp_padding: bool = False,
+        *,
+        prepare_inputs_during_sync: Callable[[], None] | None = None,
+        lmhead_num_reqs: int | None = None,
+    ) -> tuple[int, torch.Tensor | None, CUDAGraphMode, int | None]:
         if _MERGE_MTP_DP_SYNC:
             cached = self.__dict__.pop("_merged_mtp_dp_sync", None)
             if is_draft_model and cached is not None:
@@ -755,14 +775,15 @@ class NPUModelRunner(GPUModelRunner):
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
         if self.dp_size == 1:
-            return num_tokens, None, cudagraph_mode
+            return num_tokens, None, cudagraph_mode, lmhead_num_reqs
 
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
-            return num_tokens, num_tokens_after_padding, cudagraph_mode
+            return num_tokens, num_tokens_after_padding, cudagraph_mode, None
 
         merge = _MERGE_MTP_DP_SYNC and not is_draft_model
-        packed_tensor = torch.zeros(3 if merge else 2, self.dp_size, device="cpu", dtype=torch.int32)
+        rows = 2 + int(merge) + int(lmhead_num_reqs is not None)
+        packed_tensor = torch.zeros(rows, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
         if merge:
@@ -770,6 +791,10 @@ class NPUModelRunner(GPUModelRunner):
             if role == _MTP_DP_DUMMY_LOCAL and allow_dp_padding:
                 role = _MTP_DP_DUMMY_PADDED
             packed_tensor[2][self.dp_rank] = role
+        # A merged dummy pass can use the real request bound even when the
+        # target graph pads its local batch to more requests.
+        if lmhead_num_reqs is not None and (not merge or role > 0):
+            packed_tensor[-1][self.dp_rank] = lmhead_num_reqs
         group = get_dp_group().cpu_group
         if prepare_inputs_during_sync is None:
             dist.all_reduce(packed_tensor, group=group)
@@ -785,6 +810,7 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
+        synced_lmhead_reqs = int(packed_tensor[-1].max().item()) if lmhead_num_reqs is not None else None
 
         if merge:
             # This metadata is already on CPU and has one entry per DP rank.
@@ -799,8 +825,12 @@ class NPUModelRunner(GPUModelRunner):
                 draft_max = max(draft_counts)
                 self._merged_mtp_dp_sync = (
                     draft_counts[self.dp_rank],
-                    (draft_max, torch.full((self.dp_size,), draft_max, device="cpu", dtype=torch.int32),
-                     CUDAGraphMode.NONE),
+                    (
+                        draft_max,
+                        torch.full((self.dp_size,), draft_max, device="cpu", dtype=torch.int32),
+                        CUDAGraphMode.NONE,
+                        synced_lmhead_reqs,
+                    ),
                 )
 
         # Create a tensor for num_tokens_after_padding
@@ -811,7 +841,7 @@ class NPUModelRunner(GPUModelRunner):
         else:
             num_tokens_after_padding = num_tokens_across_dp.cpu()
 
-        return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
+        return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode, synced_lmhead_reqs
 
     def _can_merge_mtp_dp_sync(self) -> bool:
         # These paths preserve target_token_ids.shape[0] for the first draft
@@ -2978,6 +3008,12 @@ class NPUModelRunner(GPUModelRunner):
             sync_metadata = self._sync_metadata_across_dp
             if prepare_inputs_during_sync is not None:
                 sync_metadata = partial(sync_metadata, prepare_inputs_during_sync=prepare_inputs_during_sync)
+            if (
+                _MERGE_MTP_DP_SYNC
+                and type(getattr(self, "drafter", None)) is AscendEagleProposer
+                and self.drafter._uses_lmhead_request_padding()
+            ):
+                sync_metadata = partial(sync_metadata, lmhead_num_reqs=num_reqs)
             _, num_tokens_across_dp, synced_cudagraph_mode = sync_metadata(
                 num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,

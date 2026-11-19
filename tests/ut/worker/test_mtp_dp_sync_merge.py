@@ -77,9 +77,13 @@ class Proposer:
     use_cuda_graph = False
     needs_extra_input_slots = False
 
+    def _uses_lmhead_request_padding(self):
+        return False
+
 
 def load_production(torch=CpuArrays, merge=True):
-    methods = {"_sync_metadata_across_dp", "_can_merge_mtp_dp_sync", "_mtp_dp_sync_active_role",
+    methods = {"_sync_metadata_across_dp", "_sync_dp_metadata", "_can_merge_mtp_dp_sync",
+               "_mtp_dp_sync_active_role",
                "execute_model", "sample_tokens", "_dummy_run",
                "_determine_batch_execution_and_padding", "_pad_for_sequence_parallelism"}
     cls = copy.deepcopy(next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "NPUModelRunner"))
@@ -164,6 +168,31 @@ class MergeTests(unittest.TestCase):
                 self.assertIsNone(r.__dict__.get("_merged_mtp_dp_sync"))
                 r._sync_metadata_across_dp([6, 4, 12][rank], is_draft_model=True)
                 self.assertEqual(len(fake.calls), 2, "a second draft call must not reuse the prediction")
+
+    def test_lmhead_requests_share_existing_collective_with_real_and_dummy_ranks(self):
+        counts = [12, 6, 12]
+        local_requests = [2, 1, 4]
+        for eligible in (False, True):
+            for rank in range(3):
+                with self.subTest(eligible=eligible, rank=rank):
+                    roles = [12, 6 if eligible else 0, -2]
+                    advertised_requests = [2, 1 if eligible else 0, 0]
+                    fake = Collective([
+                        [counts, [0, 0, 0], roles, advertised_requests],
+                        [counts, [0, 0, 0], local_requests],
+                    ])
+                    self.p["dist"] = fake
+                    r = runner(self.p, rank)
+                    r._mtp_dp_sync_role = roles[rank]
+                    r._sync_metadata_across_dp(
+                        counts[rank], allow_dp_padding=True, lmhead_num_reqs=local_requests[rank]
+                    )
+                    draft = r._sync_dp_metadata(
+                        counts[rank], is_draft_model=True, lmhead_num_reqs=local_requests[rank]
+                    )
+                    self.assertEqual(fake.calls[0][0][-1, rank], advertised_requests[rank])
+                    self.assertEqual((draft[0], draft[2], draft[3]), (12, Mode.NONE, 2 if eligible else 4))
+                    self.assertEqual(len(fake.calls), 1 if eligible else 2)
 
     def test_any_ineligible_rank_keeps_both_collectives_symmetrically(self):
         for role in (0, -3):
