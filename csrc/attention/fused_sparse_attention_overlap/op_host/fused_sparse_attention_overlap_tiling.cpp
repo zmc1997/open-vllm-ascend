@@ -1765,15 +1765,24 @@ ge::graphStatus FusedSparseAttentionOverlapInfoParser::GetAttrParaInfo()
     opParamInfo_.sparseBlockSize = attrs->GetAttrPointer<int64_t>(SPARSE_BLOCK_SIZE_ATTR_INDEX);
     opParamInfo_.scaleValue = attrs->GetAttrPointer<float>(SCALE_VALUE_ATTR_INDEX);
     opParamInfo_.sparseMode = attrs->GetAttrPointer<int64_t>(SPARSE_MODE_ATTR_INDEX);
-    opParamInfo_.preTokens = attrs->GetAttrPointer<int64_t>(PRE_TOKENS_ATTR_INDEX);
-    opParamInfo_.nextTokens = attrs->GetAttrPointer<int64_t>(NEXT_TOKENS_ATTR_INDEX);
-    opParamInfo_.attentionMode = attrs->GetAttrPointer<int64_t>(ATTENTION_MODE_ATTR_INDEX);
-    opParamInfo_.returnSoftmaxLse = attrs->GetAttrPointer<bool>(RETURN_SOFTMAX_LSE_ATTR_INDEX);
+    const bool standalone = IsFusedSparseAttentionOverlapStandaloneOp(opName_);
+    const size_t attrCount = attrs->GetAttrNum();
+    const auto shouldReadAttr = [standalone, attrCount](size_t index) {
+        return !standalone || index < attrCount;
+    };
+    opParamInfo_.preTokens = shouldReadAttr(PRE_TOKENS_ATTR_INDEX) ?
+        attrs->GetAttrPointer<int64_t>(PRE_TOKENS_ATTR_INDEX) : nullptr;
+    opParamInfo_.nextTokens = shouldReadAttr(NEXT_TOKENS_ATTR_INDEX) ?
+        attrs->GetAttrPointer<int64_t>(NEXT_TOKENS_ATTR_INDEX) : nullptr;
+    opParamInfo_.attentionMode = shouldReadAttr(ATTENTION_MODE_ATTR_INDEX) ?
+        attrs->GetAttrPointer<int64_t>(ATTENTION_MODE_ATTR_INDEX) : nullptr;
+    opParamInfo_.returnSoftmaxLse = shouldReadAttr(RETURN_SOFTMAX_LSE_ATTR_INDEX) ?
+        attrs->GetAttrPointer<bool>(RETURN_SOFTMAX_LSE_ATTR_INDEX) : nullptr;
     static const int64_t defaultPreTokens = INT64_MAX;
     static const int64_t defaultNextTokens = INT64_MAX;
     static const int64_t defaultAttentionMode = 2;
     static const bool defaultReturnSoftmaxLse = false;
-    if (IsFusedSparseAttentionOverlapStandaloneOp(opName_)) {
+    if (standalone) {
         if (opParamInfo_.preTokens == nullptr) {
             opParamInfo_.preTokens = &defaultPreTokens;
         }
